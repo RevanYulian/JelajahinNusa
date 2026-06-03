@@ -59,6 +59,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Login - JelajahinNusa</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -103,10 +104,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .input-field {
             @apply w-full px-5 py-3 bg-cream-light rounded-xl text-black placeholder-gray-600 focus:ring-0;
         }
-        .input-field:focus { 
-            outline: none; 
-            box-shadow: 0 0 0 2px rgba(255,255,255,0.5); 
-        }
+        /* Sembunyikan ikon mata bawaan browser agar tidak dobel dengan custom icon */
+        .input-field::-ms-reveal { display: none; }
+        .input-field::-ms-clear { display: none; }
 
         /* Button & Links */
         .btn-submit {
@@ -154,18 +154,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <form method="POST" action="login.php" class="form-space">
                 <div>
                     <input type="email" name="email" placeholder="E-mail" required
+                           autocomplete="email"
                            value="<?= htmlspecialchars($_POST['email'] ?? '') ?>"
                            class="input-field">
                 </div>
                 <div>
                     <div style="position:relative">
                         <input type="password" name="password" id="loginPw" placeholder="Kata Sandi" required
+                               autocomplete="current-password"
                                class="input-field" style="padding-right:48px">
-                        <span onclick="togglePw('loginPw',this)" style="position:absolute;right:14px;top:50%;transform:translateY(-50%);cursor:pointer;color:#888;display:flex;align-items:center;line-height:1;user-select:none"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="12" rx="10" ry="6"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg></span>
-                    </div>
-                    <div style="text-align:right;margin-top:6px">
-                        <a href="lupa_sandi.php" class="link-green" style="font-size:13px">Lupa Kata Sandi?</a>
-                    </div>
+                        <i class="fas fa-eye" id="loginPwIcon"
+                           onclick="togglePw('loginPw',this)"
+                           style="position:absolute;right:16px;top:50%;transform:translateY(-50%);cursor:pointer;color:#666;font-size:16px;"></i>
+                    </div>w
                 </div>
 
                 <div class="h-8"></div>
@@ -192,10 +193,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <script>
     function togglePw(id, icon) {
         const el = document.getElementById(id);
-        el.type = el.type === 'password' ? 'text' : 'password';
-        icon.innerHTML = el.type === 'password'
-            ? '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="12" rx="10" ry="6"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg>'
-            : '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.5 10.68A3 3 0 0 0 14.32 14.5"/><path d="M6.61 6.61A13.5 13.5 0 0 0 2 12s4 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><path d="M17.63 17.63A13.5 13.5 0 0 0 22 12s-4-7-10-7a9.77 9.77 0 0 0-4.95 1.37"/></svg>';
+        const show = el.type === 'password';
+        el.type = show ? 'text' : 'password';
+        icon.className = show ? 'fas fa-eye-slash' : 'fas fa-eye';
     }
     </script>
 </body>

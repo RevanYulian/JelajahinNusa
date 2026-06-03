@@ -6,6 +6,7 @@ require_once 'config.php';
 require_once 'navbar.php';
 require_once 'footer.php';
 session_start();
+require_once 'visitor_tracker.php';
 $session = getSession();
 $pdo     = getDB();
 

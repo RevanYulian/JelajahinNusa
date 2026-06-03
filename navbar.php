@@ -143,6 +143,13 @@ header{position:sticky;top:0;z-index:9000;background:rgba(18,18,18,.85);backdrop
     .menu-toggle-nav{display:block;}
     .btn-masuk,.btn-daftar{padding:7px 14px;font-size:13px;}
 }
+@media(max-width:768px){
+    .logo img{height:60px;}
+    .search-bar{ padding:6px 10px; }
+    .search-bar input{ width:90px; font-size:12px; }
+    .header-right{gap:8px;}
+    .search-suggestions{width:calc(100vw - 32px);left:50%;transform:translateX(-50%);}
+}
 </style>
 <?php }
 

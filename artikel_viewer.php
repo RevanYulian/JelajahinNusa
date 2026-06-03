@@ -7,6 +7,7 @@ require_once 'navbar.php';
 require_once 'footer.php';
 
 session_start();
+require_once 'visitor_tracker.php';
 $session   = getSession();
 $pdo       = getDB();
 $artikelId = trim($_GET['id'] ?? '');
@@ -54,6 +55,18 @@ $art = $stmt->fetch(PDO::FETCH_ASSOC);
 if (!$art) { http_response_code(404); die('Artikel tidak ditemukan.'); }
 
 $pdo->prepare("UPDATE artikel SET views = views + 1 WHERE id = ?")->execute([$artikelId]);
+
+// ── Catat ke artikel_views_log untuk statistik harian ────────
+try {
+    $pdo->prepare(
+        "INSERT INTO artikel_views_log (artikel_id, user_id, ip_address, viewed_at)
+         VALUES (?, ?, ?, NOW())"
+    )->execute([
+        $artikelId,
+        $session['id'] ?? null,
+        $_SERVER['REMOTE_ADDR'] ?? null,
+    ]);
+} catch (\Exception $e) { /* tabel belum ada, abaikan */ }
 
 // ── Artikel terkait ──────────────────────────────────────────
 $relStmt = $pdo->prepare(
@@ -323,12 +336,12 @@ if (!empty($art['info_json'])) {
         </div>
       </div>
       <?php else: ?>
-      <a href="login.php" class="gallery-card gallery-card-add">
+      <div class="gallery-card gallery-card-add" onclick="openGaleriLoginModal()">
         <div class="gallery-add-inner">
           <i class="fas fa-sign-in-alt"></i>
           <span>Masuk untuk<br>Bagikan</span>
         </div>
-      </a>
+      </div>
       <?php endif; ?>
 
       <?php foreach ($galleryJson as $g): ?>
@@ -356,6 +369,45 @@ if (!empty($art['info_json'])) {
       <?php endforeach; ?>
     </div>
   </section>
+  <?php endif; ?>
+
+  <!-- Modal Login untuk Galeri (guest) -->
+  <?php if (!$session): ?>
+  <div class="modal-kontribusi-overlay" id="galeriLoginModal" onclick="if(event.target===this)closeGaleriLoginModal()">
+    <div class="modal-kontribusi-box" style="max-width:420px;text-align:center;">
+      <div style="position:relative;">
+        <button onclick="closeGaleriLoginModal()" style="position:absolute;top:0;right:0;background:none;border:none;color:#aaa;font-size:22px;cursor:pointer;line-height:1;">&times;</button>
+        <div style="width:64px;height:64px;border-radius:50%;background:rgba(31,69,41,.25);border:1px solid rgba(31,69,41,.5);display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:26px;color:#4caf70;">
+          <i class="fas fa-camera"></i>
+        </div>
+        <h3 style="justify-content:center;margin-bottom:10px;font-size:18px;">Masuk untuk Berbagi Foto</h3>
+        <p style="font-size:13px;color:#aaa;margin-bottom:24px;line-height:1.7;">
+          Punya foto momen terbaikmu di sini?<br>Masuk atau daftar dulu yuk &#8212; gratis!
+        </p>
+        <div style="display:flex;gap:12px;justify-content:center;">
+          <a href="login.php" style="flex:1;padding:12px 20px;border-radius:12px;background:#fff;color:#000;font-size:13px;font-weight:600;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;transition:.2s;">
+            <i class="fas fa-sign-in-alt"></i> Masuk
+          </a>
+          <a href="register.php" style="flex:1;padding:12px 20px;border-radius:12px;background:transparent;color:#fff;font-size:13px;font-weight:600;border:1px solid #333;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;transition:.2s;">
+            <i class="fas fa-user-plus"></i> Daftar
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+  function openGaleriLoginModal() {
+    document.getElementById('galeriLoginModal').classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+  function closeGaleriLoginModal() {
+    document.getElementById('galeriLoginModal').classList.remove('open');
+    document.body.style.overflow = '';
+  }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeGaleriLoginModal();
+  });
+  </script>
   <?php endif; ?>
 
   <!-- Modal Kontribusi Foto -->

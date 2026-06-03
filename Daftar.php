@@ -5,6 +5,7 @@
 require_once 'config.php';
 session_start();
 
+
 // Jika sudah login, langsung ke index
 $session = getSession();
 if ($session) redirect('index.php');
@@ -64,6 +65,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Daftar - JelajahinNusa</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -115,10 +117,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .input-field {
             @apply w-full px-5 py-3 bg-cream-light rounded-xl text-black placeholder-gray-600 focus:ring-0;
         }
-        .input-field:focus { 
-            outline: none; 
-            box-shadow: 0 0 0 2px rgba(255,255,255,0.5); 
-        }
+        /* Sembunyikan ikon mata bawaan browser agar tidak dobel dengan custom icon */
+        .input-field::-ms-reveal { display: none; }
+        .input-field::-ms-clear { display: none; }
 
         /* Divider "Atau" */
         .divider-container {
@@ -188,20 +189,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <form method="POST" action="daftar.php">
                 <div class="input-group">
                     <input type="text" name="username" placeholder="Username" required
+                           autocomplete="off"
                            value="<?= htmlspecialchars($_POST['username'] ?? '') ?>"
                            class="input-field">
                 </div>
                 <div class="input-group">
                     <input type="email" name="email" placeholder="E-mail" required
+                           autocomplete="email"
                            value="<?= htmlspecialchars($_POST['email'] ?? '') ?>"
                            class="input-field">
                 </div>
                 <div class="input-group" style="margin-bottom:6px">
                     <div style="position:relative">
                         <input type="password" name="password" id="regPw" placeholder="Kata Sandi (min. 6 karakter)" required
-                               minlength="6" class="input-field" style="padding-right:48px"
+                               minlength="6" autocomplete="new-password"
+                               class="input-field" style="padding-right:48px"
                                oninput="checkStrength(this.value)">
-                        <span onclick="togglePw('regPw',this)" style="position:absolute;right:14px;top:50%;transform:translateY(-50%);cursor:pointer;color:#888;display:flex;align-items:center;line-height:1;user-select:none"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span>
+                        <i class="fas fa-eye" id="regPwIcon"
+                           onclick="togglePw('regPw',this)"
+                           style="position:absolute;right:16px;top:50%;transform:translateY(-50%);cursor:pointer;color:#666;font-size:16px;"></i>
                     </div>
                     <div style="height:4px;background:rgba(255,255,255,.1);border-radius:4px;margin-top:8px;overflow:hidden">
                         <div id="strengthBar" style="height:100%;width:0;border-radius:4px;transition:all .3s"></div>
@@ -251,10 +257,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <script>
     function togglePw(id, icon) {
         const el = document.getElementById(id);
-        el.type = el.type === 'password' ? 'text' : 'password';
-        icon.innerHTML = el.type === 'password'
-            ? '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>'
-            : '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+        const show = el.type === 'password';
+        el.type = show ? 'text' : 'password';
+        icon.className = show ? 'fas fa-eye-slash' : 'fas fa-eye';
     }
     function checkStrength(val) {
         const bar   = document.getElementById("strengthBar");

@@ -6,6 +6,7 @@ require_once 'config.php';
 require_once 'navbar.php';
 require_once 'footer.php';
 session_start();
+require_once 'visitor_tracker.php';
 $session = getSession();
 $pdo     = getDB();
 
@@ -80,7 +81,8 @@ $kategoriIcon = [
         :root{ --dark-bg:#000; --dark-bg-secondary:#1A1A1A; --text-primary:#FFF; --text-secondary:#AAA; --accent-green:#1F4529; --card-overlay:linear-gradient(180deg,rgba(0,0,0,0) 0%,rgba(0,0,0,.7) 100%); }
         *{ margin:0; padding:0; box-sizing:border-box; }
         html{ scroll-behavior:smooth; }
-        body{ overflow-x:hidden; font-family:'Poppins',Arial,sans-serif; background:var(--dark-bg); color:var(--text-primary); line-height:1.6; zoom:90%; }
+        body{ overflow-x:hidden; font-family:'Poppins',Arial,sans-serif; background:var(--dark-bg); color:var(--text-primary); line-height:1.6; }
+        @media(min-width:1025px){ body{ zoom:90%; } }
         .container{ max-width:1200px; margin:0 auto; padding:0 30px; }
         a{ text-decoration:none; color:inherit; }
         ul{ list-style:none; }
@@ -100,6 +102,11 @@ $kategoriIcon = [
         .hero-dots{ position:absolute; bottom:50px; right:50px; display:flex; flex-direction:column; gap:12px; z-index:2; }
         .dot{ width:10px; height:10px; border-radius:50%; background:rgba(255,255,255,.3); cursor:pointer; transition:.3s; }
         .dot.active{ background:var(--text-primary); transform:scale(1.2); }
+        /* Scroll arrow */
+        .hero-scroll-arrow{ position:absolute; bottom:36px; left:50%; transform:translateX(-50%); z-index:2; cursor:pointer; display:flex; flex-direction:column; align-items:center; gap:4px; opacity:.7; transition:opacity .3s; border:none; background:none; padding:8px; }
+        .hero-scroll-arrow:hover{ opacity:1; }
+        .hero-scroll-arrow span{ display:block; width:20px; height:20px; border-right:2px solid #fff; border-bottom:2px solid #fff; transform:rotate(45deg); animation:scrollBounce 1.4s ease-in-out infinite; }
+        @keyframes scrollBounce{ 0%,100%{ transform:rotate(45deg) translate(0,0); } 50%{ transform:rotate(45deg) translate(5px,5px); } }
         /* Popular */
         .popular-destinations{ padding:90px 0; }
         .popular-destinations .section-title{ font-size:36px; font-weight:700; text-align:left; margin-bottom:10px; padding:0; }
@@ -168,10 +175,49 @@ $kategoriIcon = [
         .wt-card-skeleton{ flex:0 0 calc((100% - 28px)/3); border-radius:20px; background:linear-gradient(90deg,#111 25%,#1e1e1e 50%,#111 75%); background-size:800px 100%; animation:shimmer 1.5s infinite; }
         @media(max-width:800px){ .wt-track{ height:320px; } .wt-card{ flex:0 0 calc(78% - 7px); } }
         @media(max-width:768px){
-            .popular-grid{ grid-template-columns:repeat(2,1fr); }
-            .reco-grid{ grid-template-columns:repeat(2,1fr); }
-            .app-cta-content{ flex-direction:column; padding:30px; }
-            .hero-content h1{ font-size:28px; }
+            section{ padding:50px 0; }
+            .container{ padding:0 16px; }
+
+            /* Hero */
+            .hero{ height:calc(100dvh - 60px); }
+            .hero-content h1{ font-size:22px; }
+            .hero-content p{ font-size:13px; }
+            .hero-dots{ bottom:20px; right:20px; }
+
+            /* Destinasi */
+            .popular-destinations{ padding:50px 0; }
+            .popular-destinations .section-title{ font-size:24px; }
+            .popular-grid{ grid-template-columns:repeat(2,1fr); gap:10px; }
+            .popular-card{ height:150px; }
+            .card-content h4{ font-size:16px; }
+
+            /* CTA */
+            .cta-section h2{ font-size:22px; }
+            .cta-section p{ font-size:13px; }
+
+            /* Wisata Terbaru */
+            .wt-header{ padding:0 16px; flex-wrap:wrap; gap:10px; }
+            .wt-header h2{ font-size:20px; }
+            .wt-cards-wrap{ padding:0 16px; }
+            .wt-track{ height:260px; }
+            .wt-card{ flex:0 0 calc(85% - 7px); }
+
+            /* App CTA */
+            .app-cta{ margin:0 16px 40px; border-radius:16px; }
+            .app-cta-content{ flex-direction:column; padding:28px 20px; gap:20px; text-align:center; }
+            .app-cta-text h3{ font-size:18px; margin-bottom:16px; }
+            .app-buttons{ justify-content:center; flex-wrap:wrap; gap:10px; }
+            .app-buttons img{ height:36px; }
+            .app-cta-img{ display:none; }
+
+            /* Reko */
+            .reco-grid{ grid-template-columns:repeat(2,1fr); gap:12px; }
+            .reco-card{ height:160px; }
+        }
+        @media(max-width:400px){
+            .popular-grid{ grid-template-columns:1fr 1fr; gap:8px; }
+            .popular-card{ height:120px; }
+            .app-cta-text h3{ font-size:15px; }
         }
     </style>
 </head>
@@ -186,6 +232,9 @@ $kategoriIcon = [
             <div class="hero-content" id="hero-content"></div>
         </div>
         <div class="hero-dots" id="hero-dots"></div>
+        <button class="hero-scroll-arrow" onclick="document.getElementById('artikel').scrollIntoView({behavior:'smooth'})" aria-label="Scroll ke bawah">
+            <span></span>
+        </button>
     </section>
 
     <!-- Destinasi Berdasarkan Daerah -->

@@ -6,16 +6,18 @@
 //    articles           → Manajemen Artikel
 //    settings           → Pengaturan Sistem
 //    reviews            → Ulasan Pengguna
+//    statistik          → Statistik & Analitik
 //    api                → JSON API endpoint
 // ============================================================
 require_once 'config.php';
+
 
 // ============================================================
 //  PENTING: Deteksi mode API lebih awal — SEBELUM requireAdmin()
 //  Supaya fetch/Ajax dari JS tidak kena redirect HTML login,
 //  melainkan mendapat JSON error 401 yang bisa dibaca JS.
 // ============================================================
-$mode = $_GET['mode'] ?? 'users';
+$mode = $_GET['mode'] ?? 'statistik';
 
 if ($mode === 'api') {
     if (session_status() === PHP_SESSION_NONE) session_start();
@@ -31,6 +33,11 @@ if ($mode === 'api') {
 
     $pdo    = getDB();
     $action = $_GET['action'] ?? '';
+
+    // ---- notifikasi helper ----
+    if (file_exists(__DIR__ . '/notifikasi_helper.php')) {
+        require_once __DIR__ . '/notifikasi_helper.php';
+    }
 
     // ---- helpers ----
     if (!function_exists('jsonOk')) {
@@ -174,12 +181,12 @@ if ($mode === 'api') {
         case 'get_articles':
             try {
                 $articles = $pdo->query("
-                    SELECT a.id, a.title, k.nama AS category, a.location,
+                    SELECT a.id, a.title, COALESCE(k.nama, '—') AS category, a.location,
                            a.excerpt, a.image, a.file_html, a.status, a.views,
                            DATE_FORMAT(a.created_at,'%d %b %Y') AS date,
                            a.kategori_id
                     FROM artikel a
-                    JOIN kategori_artikel k ON a.kategori_id = k.id
+                    LEFT JOIN kategori_artikel k ON a.kategori_id = k.id
                     ORDER BY a.created_at DESC
                 ")->fetchAll(PDO::FETCH_ASSOC);
                 $categories = $pdo->query("SELECT id, nama FROM kategori_artikel ORDER BY nama")->fetchAll(PDO::FETCH_ASSOC);
@@ -209,8 +216,8 @@ if ($mode === 'api') {
             try {
                 $id   = $_GET['id'] ?? '';
                 $stmt = $pdo->prepare(
-                    "SELECT a.*, k.nama AS category FROM artikel a
-                     JOIN kategori_artikel k ON a.kategori_id = k.id
+                    "SELECT a.*, COALESCE(k.nama, '—') AS category FROM artikel a
+                     LEFT JOIN kategori_artikel k ON a.kategori_id = k.id
                      WHERE a.id=? LIMIT 1"
                 );
                 $stmt->execute([$id]);
@@ -284,19 +291,26 @@ if ($mode === 'api') {
                 }
                 $info_json = $infoArr ? json_encode($infoArr, JSON_UNESCAPED_UNICODE) : null;
 
-                // gallery_json: dari ID galeri yang dipilih → ambil image_path dari tabel galeri
-                $galIds  = array_filter(array_map('trim', explode(',', $_POST['gallery_ids'] ?? '')));
-                $galArr  = [];
-                foreach ($galIds as $gid) {
-                    $gid = trim($gid); if (!$gid) continue;
-                    $gr  = $pdo->prepare("SELECT id, image_path, judul FROM galeri WHERE id=? LIMIT 1");
-                    $gr->execute([$gid]);
-                    $row = $gr->fetch(PDO::FETCH_ASSOC);
-                    if ($row) $galArr[] = ['galeri_id' => $row['id'], 'src' => $row['image_path'], 'caption' => $row['judul'] ?? ''];
+                // gallery_json: dari ID galeri yang dipilih → ambil sekaligus dengan IN
+                $galIds = array_values(array_filter(array_map('trim', explode(',', $_POST['gallery_ids'] ?? ''))));
+                $galArr = [];
+                if ($galIds) {
+                    $placeholders = implode(',', array_fill(0, count($galIds), '?'));
+                    $grRows = $pdo->prepare("SELECT id, image_path, judul FROM galeri WHERE id IN ($placeholders)");
+                    $grRows->execute($galIds);
+                    $grMap = [];
+                    foreach ($grRows->fetchAll(PDO::FETCH_ASSOC) as $r) $grMap[$r['id']] = $r;
+                    foreach ($galIds as $gid) {
+                        if (isset($grMap[$gid])) $galArr[] = ['galeri_id' => $grMap[$gid]['id'], 'src' => $grMap[$gid]['image_path'], 'caption' => $grMap[$gid]['judul'] ?? ''];
+                    }
                 }
                 $gallery_json = $galArr ? json_encode($galArr, JSON_UNESCAPED_UNICODE) : null;
 
-                if (!$title || !$kategori_id) jsonErr('Judul dan kategori wajib diisi.');
+                if (!$title) jsonErr('Judul wajib diisi.');
+                // Jika kategori kosong, pakai kategori pertama yang ada di DB sebagai fallback
+                if (!$kategori_id) {
+                    $kategori_id = $pdo->query("SELECT id FROM kategori_artikel ORDER BY id LIMIT 1")->fetchColumn() ?: null;
+                }
                 $slug      = strtolower(preg_replace('/[^a-zA-Z0-9]+/', '-', $title)) . '-' . substr(bin2hex(random_bytes(3)), 0, 6);
                 $id        = bin2hex(random_bytes(16));
                 $file_html = 'artikel_viewer.php?id=' . $id;
@@ -308,6 +322,11 @@ if ($mode === 'api') {
                 );
                 $stmt->execute([$id, $title, $slug, $kategori_id, $location, '', $content,
                                 $image, $maps_embed, $info_json, $gallery_json, $file_html, $status]);
+                // ── Notifikasi: artikel baru dipublikasikan ──
+                if ($status === 'published' && function_exists('kirimBroadcastArtikel')) {
+                    kirimBroadcastArtikel($pdo, $id, $title, $location);
+                }
+
                 jsonOk(['id' => $id], 'Artikel berhasil ditambahkan.');
             } catch (\Exception $e) {
                 jsonErr('DB Error add_article: ' . $e->getMessage());
@@ -343,19 +362,30 @@ if ($mode === 'api') {
                 }
                 $info_json = $infoArr ? json_encode($infoArr, JSON_UNESCAPED_UNICODE) : null;
 
-                // gallery_json dari ID galeri
-                $galIds  = array_filter(array_map('trim', explode(',', $_POST['gallery_ids'] ?? '')));
-                $galArr  = [];
-                foreach ($galIds as $gid) {
-                    $gid = trim($gid); if (!$gid) continue;
-                    $gr  = $pdo->prepare("SELECT id, image_path, judul FROM galeri WHERE id=? LIMIT 1");
-                    $gr->execute([$gid]);
-                    $row = $gr->fetch(PDO::FETCH_ASSOC);
-                    if ($row) $galArr[] = ['galeri_id' => $row['id'], 'src' => $row['image_path'], 'caption' => $row['judul'] ?? ''];
+                // gallery_json dari ID galeri — ambil sekaligus dengan IN
+                $galIds = array_values(array_filter(array_map('trim', explode(',', $_POST['gallery_ids'] ?? ''))));
+                $galArr = [];
+                if ($galIds) {
+                    $placeholders = implode(',', array_fill(0, count($galIds), '?'));
+                    $grRows = $pdo->prepare("SELECT id, image_path, judul FROM galeri WHERE id IN ($placeholders)");
+                    $grRows->execute($galIds);
+                    $grMap = [];
+                    foreach ($grRows->fetchAll(PDO::FETCH_ASSOC) as $r) $grMap[$r['id']] = $r;
+                    foreach ($galIds as $gid) {
+                        if (isset($grMap[$gid])) $galArr[] = ['galeri_id' => $grMap[$gid]['id'], 'src' => $grMap[$gid]['image_path'], 'caption' => $grMap[$gid]['judul'] ?? ''];
+                    }
                 }
                 $gallery_json = $galArr ? json_encode($galArr, JSON_UNESCAPED_UNICODE) : null;
 
-                if (!$id || !$title || !$kategori_id) jsonErr('ID, judul, dan kategori wajib diisi.');
+                if (!$id || !$title) jsonErr('ID dan judul wajib diisi.');
+                // Jika kategori kosong, pakai kategori pertama yang ada di DB sebagai fallback
+                if (!$kategori_id) {
+                    $kategori_id = $pdo->query("SELECT id FROM kategori_artikel ORDER BY id LIMIT 1")->fetchColumn() ?: null;
+                }
+                // ── Ambil status lama sebelum update ──
+                $stmtStatusLama = $pdo->prepare("SELECT status FROM artikel WHERE id=? LIMIT 1");
+                $stmtStatusLama->execute([$id]);
+                $statusSebelum = $stmtStatusLama->fetchColumn();
                 $pdo->prepare(
                     "UPDATE artikel
                      SET title=?, kategori_id=?, location=?, excerpt=?, content=?,
@@ -363,6 +393,10 @@ if ($mode === 'api') {
                      WHERE id=?"
                 )->execute([$title, $kategori_id, $location, '', $content,
                             $image, $maps_embed, $info_json, $gallery_json, $status, $id]);
+                // ── Notif: hanya jika baru dipublikasikan (draft → published) ──
+                if ($status === 'published' && $statusSebelum !== 'published' && function_exists('kirimBroadcastArtikel')) {
+                    kirimBroadcastArtikel($pdo, $id, $title, $location);
+                }
                 jsonOk(null, 'Artikel berhasil diperbarui.');
             } catch (\Exception $e) {
                 jsonErr('DB Error update_article: ' . $e->getMessage());
@@ -390,96 +424,6 @@ if ($mode === 'api') {
                 jsonErr('DB Error delete_usul: ' . $e->getMessage());
             }
             break;
-
-        // ---------- broadcast notifikasi ----------
-        case 'send_broadcast':
-            try {
-                $judul  = trim($_POST['judul']  ?? '');
-                $pesan  = trim($_POST['pesan']  ?? '');
-                $tipe   = in_array($_POST['tipe']   ?? '', ['info','artikel_baru','sistem','populer']) ? $_POST['tipe']   : 'info';
-                $target = in_array($_POST['target'] ?? '', ['semua','notif_sistem','notif_artikel_baru']) ? $_POST['target'] : 'semua';
-                if (!$judul || !$pesan) jsonErr('Judul dan pesan wajib diisi.');
-
-                // Pastikan tabel ada
-                $pdo->exec("CREATE TABLE IF NOT EXISTS broadcast_notif (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    judul VARCHAR(255) NOT NULL, pesan TEXT NOT NULL,
-                    tipe VARCHAR(30) NOT NULL DEFAULT 'info',
-                    target VARCHAR(30) NOT NULL DEFAULT 'semua',
-                    total_kirim INT DEFAULT 0, admin_id VARCHAR(64),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-                $pdo->exec("CREATE TABLE IF NOT EXISTS notifikasi_user (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    user_id VARCHAR(64) NOT NULL, broadcast_id INT DEFAULT NULL,
-                    judul VARCHAR(255) NOT NULL, pesan TEXT NOT NULL,
-                    tipe VARCHAR(30) DEFAULT 'info', is_read TINYINT(1) DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_user_read (user_id, is_read)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-                // Ambil user sesuai target
-                if ($target === 'semua') {
-                    $users = $pdo->query("SELECT u.id FROM users u WHERE u.type='user' AND u.is_active=1")->fetchAll(PDO::FETCH_COLUMN);
-                } elseif ($target === 'notif_sistem') {
-                    $users = $pdo->query("SELECT u.id FROM users u JOIN notifikasi_preferences np ON np.user_id=u.id WHERE u.type='user' AND u.is_active=1 AND np.notif_sistem=1")->fetchAll(PDO::FETCH_COLUMN);
-                } else { // notif_artikel_baru
-                    $users = $pdo->query("SELECT u.id FROM users u JOIN notifikasi_preferences np ON np.user_id=u.id WHERE u.type='user' AND u.is_active=1 AND np.notif_artikel_baru=1")->fetchAll(PDO::FETCH_COLUMN);
-                }
-
-                // Simpan broadcast record
-                $pdo->prepare("INSERT INTO broadcast_notif (judul,pesan,tipe,target,total_kirim,admin_id) VALUES (?,?,?,?,?,?)")
-                    ->execute([$judul, $pesan, $tipe, $target, count($users), $sessionData['id'] ?? null]);
-                $broadcastId = $pdo->lastInsertId();
-
-                // Insert notif per user (batch)
-                if ($users) {
-                    $placeholders = implode(',', array_fill(0, count($users), '(?,?,?,?,?)'));
-                    $vals = [];
-                    foreach ($users as $uid) {
-                        array_push($vals, $uid, $broadcastId, $judul, $pesan, $tipe);
-                    }
-                    $pdo->prepare("INSERT INTO notifikasi_user (user_id,broadcast_id,judul,pesan,tipe) VALUES $placeholders")->execute($vals);
-                }
-
-                jsonOk(['total' => count($users)], 'Notifikasi berhasil dikirim ke ' . count($users) . ' pengguna.');
-            } catch (\Exception $e) {
-                jsonErr('DB Error send_broadcast: ' . $e->getMessage());
-            }
-            break;
-
-        case 'get_broadcasts':
-            try {
-                $pdo->exec("CREATE TABLE IF NOT EXISTS broadcast_notif (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    judul VARCHAR(255) NOT NULL, pesan TEXT NOT NULL,
-                    tipe VARCHAR(30) NOT NULL DEFAULT 'info',
-                    target VARCHAR(30) NOT NULL DEFAULT 'semua',
-                    total_kirim INT DEFAULT 0, admin_id VARCHAR(64),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-                $rows = $pdo->query("SELECT b.*, u.username AS admin_name,
-                    DATE_FORMAT(b.created_at,'%d %b %Y %H:%i') AS tanggal
-                    FROM broadcast_notif b LEFT JOIN users u ON u.id=b.admin_id
-                    ORDER BY b.created_at DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
-                jsonOk($rows);
-            } catch (\Exception $e) {
-                jsonErr('DB Error get_broadcasts: ' . $e->getMessage());
-            }
-            break;
-
-        case 'delete_broadcast':
-            try {
-                $id = (int)($_POST['id'] ?? 0);
-                if (!$id) jsonErr('ID tidak valid.');
-                $pdo->prepare("DELETE FROM notifikasi_user WHERE broadcast_id=?")->execute([$id]);
-                $pdo->prepare("DELETE FROM broadcast_notif WHERE id=?")->execute([$id]);
-                jsonOk(null, 'Broadcast berhasil dihapus.');
-            } catch (\Exception $e) {
-                jsonErr('DB Error delete_broadcast: ' . $e->getMessage());
-            }
-            break;
-
         // ---- DEBUG (hapus setelah masalah teratasi) ----
         case 'debug':
             echo json_encode([
@@ -564,6 +508,10 @@ if ($mode === 'api') {
                 if (!$id) jsonErr('ID tidak valid.');
                 if (!in_array($status, ['approved','rejected','pending'])) jsonErr('Status tidak valid.');
                 $pdo->prepare("UPDATE galeri SET status=? WHERE id=?")->execute([$status, $id]);
+                // ── Notifikasi ke user pemilik foto ──
+                if (in_array($status, ['approved','rejected']) && function_exists('kirimNotifFotoKontribusi')) {
+                    kirimNotifFotoKontribusi($pdo, $id, $status);
+                }
                 // Rebuild gallery_json artikel terkait
                 $artId = $pdo->prepare("SELECT artikel_id FROM galeri WHERE id=? LIMIT 1");
                 $artId->execute([$id]); $artId = $artId->fetchColumn();
@@ -649,6 +597,28 @@ if ($mode === 'api') {
                 jsonOk(null, 'Galeri artikel berhasil diperbarui.');
             } catch (\Exception $e) {
                 jsonErr('DB Error update_artikel_gallery: ' . $e->getMessage());
+            }
+            break;
+
+        case 'remove_galeri_from_artikel':
+            try {
+                $artId  = $_POST['artikel_id'] ?? '';
+                $rawIds = $_POST['galeri_ids']  ?? '';
+                if (!$artId) jsonErr('artikel_id wajib diisi.');
+                $removeIds = array_filter(array_map('trim', explode(',', $rawIds)));
+                if (!$removeIds) jsonErr('Tidak ada foto yang dipilih untuk dihapus.');
+                $stmt = $pdo->prepare("SELECT gallery_json FROM artikel WHERE id=? LIMIT 1");
+                $stmt->execute([$artId]);
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                if (!$row) jsonErr('Artikel tidak ditemukan.');
+                $galArr = $row['gallery_json'] ? json_decode($row['gallery_json'], true) : [];
+                if (!is_array($galArr)) $galArr = [];
+                $galArr = array_values(array_filter($galArr, fn($g) => !in_array((string)($g['galeri_id'] ?? ''), array_map('strval', $removeIds))));
+                $newJson = $galArr ? json_encode($galArr, JSON_UNESCAPED_UNICODE) : null;
+                $pdo->prepare("UPDATE artikel SET gallery_json=?, updated_at=NOW() WHERE id=?")->execute([$newJson, $artId]);
+                jsonOk(['sisa' => count($galArr)], count($removeIds) . ' foto berhasil dihapus dari galeri artikel.');
+            } catch (\Exception $e) {
+                jsonErr('DB Error remove_galeri_from_artikel: ' . $e->getMessage());
             }
             break;
 
@@ -793,6 +763,18 @@ if ($mode === 'settings') {
             $toast = isset($_POST['clear_cache'])
                 ? 'Cache berhasil dibersihkan & pengaturan disimpan.'
                 : 'Pengaturan Keamanan & Performa berhasil disimpan.';
+
+            // ── Notifikasi maintenance: kirim jika baru diaktifkan ──
+            if (!empty($data['mode_maintenance']) && $data['mode_maintenance'] === '1') {
+                // Cek apakah sebelumnya sudah aktif (hindari spam notif)
+                $wasOn = $pdo->prepare("SELECT nilai FROM pengaturan_situs WHERE kunci='mode_maintenance' LIMIT 1");
+                // Nilai sudah diupdate, jadi kita lihat apakah POST ini baru ON
+                // Trigger hanya jika form baru di-submit dengan maintenance=ON
+                if (file_exists(__DIR__ . '/notifikasi_helper.php')) {
+                    require_once __DIR__ . '/notifikasi_helper.php';
+                    $mainMsg = trim($_POST['maintenance_message'] ?? 'Website sedang dalam pemeliharaan.');
+                }
+            }
         }
     }
 
@@ -819,14 +801,110 @@ if (!function_exists('adminUrl')) {
 }
 
 // ============================================================
+//  MODE: STATISTIK — ambil data sebelum render
+// ============================================================
+$stat_data          = [];
+$stat_visitor       = [];
+$stat_user_bulan    = [];
+$stat_top_artikel   = [];
+$stat_views_kat     = [];
+$stat_views_harian  = [];
+$stat_usulan_bln    = [];
+$stat_user_7hari    = [];
+
+if ($mode === 'statistik') {
+    // Helper query
+    $sq = function(string $sql, array $p = []) use ($pdo): mixed {
+        $st = $pdo->prepare($sql); $st->execute($p); return $st;
+    };
+
+    // Kartu ringkasan
+    try {
+        $stat_data = $pdo->query("SELECT * FROM v_stats_lengkap")->fetch() ?: [];
+    } catch (\Exception $e) {
+        $stat_data = [
+            'total_user'              => $sq("SELECT COUNT(*) FROM users WHERE type='user'")->fetchColumn(),
+            'user_hari_ini'           => $sq("SELECT COUNT(*) FROM users WHERE type='user' AND DATE(created_at)=CURDATE()")->fetchColumn(),
+            'total_artikel'           => $sq("SELECT COUNT(*) FROM artikel WHERE status='published'")->fetchColumn(),
+            'artikel_draft'           => $sq("SELECT COUNT(*) FROM artikel WHERE status='draft'")->fetchColumn(),
+            'total_views_artikel'     => $sq("SELECT COALESCE(SUM(views),0) FROM artikel")->fetchColumn(),
+            'total_galeri'            => $sq("SELECT COUNT(*) FROM galeri")->fetchColumn(),
+            'total_likes_galeri'      => $sq("SELECT COUNT(*) FROM galeri_likes")->fetchColumn(),
+            'total_usulan'            => $sq("SELECT COUNT(*) FROM usul_artikel")->fetchColumn(),
+            'user_banned'             => $sq("SELECT COUNT(*) FROM users WHERE is_active=0")->fetchColumn(),
+            'kunjungan_hari_ini'      => 0,
+            'unique_visitor_hari_ini' => 0,
+        ];
+    }
+
+    // Pengunjung 30 hari
+    try {
+        $stat_visitor = $sq(
+            "SELECT DATE_FORMAT(tanggal,'%d %b') AS tgl, total_kunjungan, unique_visitor
+             FROM visitor_daily
+             WHERE tanggal >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+             ORDER BY tanggal ASC"
+        )->fetchAll();
+    } catch (\Exception $e) { $stat_visitor = []; }
+
+    // User baru per bulan (12 bulan)
+    $stat_user_bulan = $sq(
+        "SELECT DATE_FORMAT(created_at,'%b %Y') AS bln, COUNT(*) AS total
+         FROM users WHERE type='user' AND created_at >= DATE_SUB(NOW(), INTERVAL 11 MONTH)
+         GROUP BY YEAR(created_at), MONTH(created_at)
+         ORDER BY YEAR(created_at), MONTH(created_at)"
+    )->fetchAll();
+
+    // Artikel terpopuler
+    $stat_top_artikel = $sq(
+        "SELECT a.title, a.views, a.created_at, k.nama AS kategori
+         FROM artikel a LEFT JOIN kategori_artikel k ON k.id=a.kategori_id
+         WHERE a.status='published' ORDER BY a.views DESC LIMIT 10"
+    )->fetchAll();
+
+    // Views per kategori
+    $stat_views_kat = $sq(
+        "SELECT k.nama, COALESCE(SUM(a.views),0) AS total_views
+         FROM kategori_artikel k
+         LEFT JOIN artikel a ON a.kategori_id=k.id AND a.status='published'
+         GROUP BY k.id, k.nama ORDER BY total_views DESC"
+    )->fetchAll();
+
+    // Views artikel harian 30 hari
+    try {
+        $stat_views_harian = $sq(
+            "SELECT DATE_FORMAT(viewed_at,'%d %b') AS tgl, COUNT(*) AS total
+             FROM artikel_views_log WHERE viewed_at >= DATE_SUB(NOW(), INTERVAL 29 DAY)
+             GROUP BY DATE(viewed_at) ORDER BY DATE(viewed_at)"
+        )->fetchAll();
+    } catch (\Exception $e) { $stat_views_harian = []; }
+
+    // Usulan per bulan
+    $stat_usulan_bln = $sq(
+        "SELECT DATE_FORMAT(created_at,'%b %Y') AS bln, COUNT(*) AS total
+         FROM usul_artikel WHERE created_at >= DATE_SUB(NOW(), INTERVAL 5 MONTH)
+         GROUP BY YEAR(created_at), MONTH(created_at)
+         ORDER BY YEAR(created_at), MONTH(created_at)"
+    )->fetchAll();
+
+    // User baru 7 hari
+    $stat_user_7hari = $sq(
+        "SELECT DATE_FORMAT(created_at,'%a') AS hari, COUNT(*) AS total
+         FROM users WHERE type='user' AND created_at >= DATE_SUB(NOW(), INTERVAL 6 DAY)
+         GROUP BY DATE(created_at), hari ORDER BY DATE(created_at)"
+    )->fetchAll();
+}
+
+// ============================================================
 //  Mulai render HTML
 // ============================================================
 
 // Judul halaman per mode
 $titles = [
-    'users'    => 'Manajemen Pengguna',
-    'articles' => 'Manajemen Artikel',
-    'settings' => 'Pengaturan',
+    'users'     => 'Manajemen Pengguna',
+    'articles'  => 'Manajemen Artikel',
+    'settings'  => 'Pengaturan',
+    'statistik' => 'Statistik & Analitik',
 ];
 $pageTitle = $titles[$mode] ?? 'Dashboard';
 ?>
@@ -837,6 +915,9 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title><?= htmlspecialchars($pageTitle) ?> - Admin JelajahinNusa</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <?php if ($mode === 'statistik'): ?>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <?php endif; ?>
     <style>
         /* ========== BASE ========== */
         :root {
@@ -1015,6 +1096,44 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
         .toast { position:fixed; bottom:30px; right:30px; background:#1F4529; color:#fff; padding:14px 22px; border-radius:10px; font-size:14px; z-index:99999; opacity:0; transform:translateY(20px); transition:.3s; pointer-events:none; }
         .toast.show { opacity:1; transform:translateY(0); }
         .toast.error { background:#C0392B; }
+
+        /* ========== STATISTIK ========== */
+        .stat-grid-8 { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:28px; }
+        .scard { background:#111; border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:18px; display:flex; align-items:center; gap:14px; transition:.25s; cursor:default; }
+        .scard:hover { border-color:rgba(31,69,41,.6); transform:translateY(-2px); }
+        /* Tooltip global ikut kursor */
+        #scardTooltipGlobal { position:fixed; background:#1e1e1e; border:1px solid rgba(255,255,255,.18); border-radius:10px; padding:10px 16px; white-space:nowrap; font-size:12px; line-height:1.7; color:#fff; pointer-events:none; opacity:0; transition:opacity .15s; z-index:99999; box-shadow:0 8px 32px rgba(0,0,0,.6); }
+        .scard.hl { border-color:#1F4529; background:rgba(31,69,41,.35); }
+        .scard-ico { width:44px; height:44px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }
+        .scard-ico.g { background:rgba(76,175,80,.15); color:#4CAF50; }
+        .scard-ico.b { background:rgba(100,181,246,.15); color:#64B5F6; }
+        .scard-ico.a { background:rgba(255,213,79,.15); color:#FFD54F; }
+        .scard-ico.r { background:rgba(239,154,154,.15); color:#EF9A9A; }
+        .scard-ico.p { background:rgba(206,147,216,.15); color:#CE93D8; }
+        .scard-val { font-size:24px; font-weight:700; line-height:1; }
+        .scard-lbl { font-size:12px; color:#AAA; margin-top:4px; }
+        .charts-r2 { display:grid; grid-template-columns:2fr 1fr; gap:20px; margin-bottom:20px; }
+        .charts-r3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:20px; margin-bottom:20px; }
+        @media(max-width:1200px){ .charts-r2,.charts-r3{ grid-template-columns:1fr; } }
+        .ccrd { background:#111; border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:22px; }
+        .ccrd h3 { font-size:14px; font-weight:600; margin-bottom:16px; display:flex; align-items:center; gap:8px; }
+        .ccrd h3 i { color:#4CAF50; font-size:13px; }
+        .ccrd canvas { max-height:230px; }
+        .stat-tbl { width:100%; border-collapse:collapse; font-size:13px; }
+        .stat-tbl thead tr { background:rgba(255,255,255,.06); }
+        .stat-tbl th { padding:10px 13px; text-align:left; color:#AAA; font-weight:500; border-bottom:1px solid rgba(255,255,255,.06); }
+        .stat-tbl td { padding:10px 13px; border-bottom:1px solid rgba(255,255,255,.03); }
+        .stat-tbl tr:last-child td { border-bottom:none; }
+        .stat-tbl tr:hover td { background:rgba(255,255,255,.03); }
+        .rk { width:26px; height:26px; border-radius:50%; background:#1F4529; display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; }
+        .rk.gold   { background:#B8860B; }
+        .rk.silver { background:#606060; }
+        .rk.bronze { background:#7B4513; }
+        .vbar-w { display:flex; align-items:center; gap:8px; }
+        .vbar { height:6px; border-radius:3px; background:#4CAF50; opacity:.7; }
+        .rng { font-size:11px; color:#666; font-weight:400; margin-left:6px; }
+        .stat-empty { text-align:center; padding:38px; color:#555; font-size:13px; }
+        .stat-empty i { font-size:32px; display:block; margin-bottom:8px; opacity:.4; }
     </style>
 </head>
 <body>
@@ -1059,12 +1178,11 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
             <a href="index.php" class="logo">JelajahinNusa</a>
             <h4>Dashboard Admin</h4>
             <nav class="nav-menu-sidebar">
+                <a href="<?= adminUrl('statistik') ?>"         <?= navActive('statistik',        $mode) ?>><i class="fas fa-chart-bar"></i> Statistik</a>
                 <a href="<?= adminUrl('users') ?>"            <?= navActive('users',            $mode) ?>><i class="fas fa-users"></i> Manajemen Pengguna</a>
                 <a href="<?= adminUrl('articles') ?>"         <?= navActive('articles',         $mode) ?>><i class="fas fa-file-invoice"></i> Manajemen Artikel</a>
                 <a href="<?= adminUrl('galeri_kontribusi') ?>" <?= navActive('galeri_kontribusi', $mode) ?>><i class="fas fa-images"></i> Manajemen Foto</a>
-                <a href="<?= adminUrl('usul_user') ?>"        <?= navActive('usul_user',        $mode) ?>><i class="fas fa-lightbulb"></i> Usul User</a>
-                <a href="<?= adminUrl('broadcast') ?>"         <?= navActive('broadcast',         $mode) ?>><i class="fas fa-bell"></i> Kirim Notifikasi</a>
-                <a href="<?= adminUrl('settings') ?>"          <?= navActive('settings',          $mode) ?>><i class="fas fa-gear"></i> Pengaturan</a>
+                <a href="<?= adminUrl('usul_user') ?>"        <?= navActive('usul_user',        $mode) ?>><i class="fas fa-lightbulb"></i> Usul User</a>                <a href="<?= adminUrl('settings') ?>"          <?= navActive('settings',          $mode) ?>><i class="fas fa-gear"></i> Pengaturan</a>
             </nav>
         </div>
         <div class="sidebar-bottom">
@@ -1423,7 +1541,7 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                     <h4 id="modalTitle">Tambah Artikel</h4>
                     <input type="hidden" id="artId">
 
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;" onkeydown="if(event.key==='Enter'&&event.target.tagName!=='TEXTAREA'){event.preventDefault();}">
                         <div class="form-group" style="grid-column:1/-1">
                             <label>Judul</label>
                             <input type="text" id="artTitle" placeholder="Judul artikel...">
@@ -1478,32 +1596,21 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                             <textarea id="artInfo" rows="4" placeholder="Jam buka: 24 jam&#10;HTM: Rp 29.000&#10;Waktu terbaik: April – Oktober"></textarea>
                             <small style="color:#888;font-size:11px">Format: <strong>Kunci: Nilai</strong> — satu baris satu item.</small>
                         </div>
-                        <div class="form-group" style="grid-column:1/-1">
-                            <label>🖼️ Galeri Foto <small style="color:#888;font-weight:normal">(pilih dari tabel galeri)</small></label>
-                            <div style="display:flex;gap:8px;margin-bottom:8px">
-                                <input type="text" id="galSearch" placeholder="Cari foto..." style="flex:1;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:8px 12px;color:#fff;font-family:'Poppins',sans-serif;outline:none">
-                                <button type="button" onclick="loadGaleriList()" style="background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:8px 14px;color:#fff;cursor:pointer;font-size:13px"><i class="fas fa-sync-alt"></i></button>
-                            </div>
-                            <div id="galeriGrid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;max-height:220px;overflow-y:auto;background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px"></div>
-                            <div style="margin-top:8px">
-                                <small style="color:#888;font-size:11px">Foto dipilih: </small>
-                                <div id="galeriSelected" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
-                                <input type="hidden" id="artGalleryIds">
-                            </div>
-                        </div>
+                        <input type="hidden" id="artGalleryIds">
                     </div>
 
                     <div class="modal-btns">
-                        <button class="btn-cancel" onclick="closeArtModal()">Batal</button>
-                        <button class="btn-save" onclick="saveArticle()">Simpan Artikel</button>
+                        <button type="button" class="btn-cancel" onclick="closeArtModal()">Batal</button>
+                        <button type="button" class="btn-save" onclick="saveArticle()">Simpan Artikel</button>
                     </div>
                 </div>
             </div>
 
             <script>
                 const API = 'dashboardAdmin.php?mode=api&action=';
-                let artPage=1, perPage=10, allArticles=[], filteredArticles=[], editingArtId=null, categories=[];
+                let artPage=1, perPage=25, allArticles=[], filteredArticles=[], editingArtId=null, categories=[];
                 let artSortCol='date', artSortDir='desc';
+                let allGaleri=[], selectedGaleri={};
 
                 function showToast(msg,type='success'){
                     const t=document.getElementById('toast'); t.textContent=msg;
@@ -1528,11 +1635,13 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                             :`<span class="badge badge-draft">Draf</span>`;
                         const viewerLink = `artikel_viewer.php?id=${encodeURIComponent(a.id)}`;
                         const tr=document.createElement('tr');
+                        const safeTitle = a.title.replace(/'/g,"\\'").replace(/"/g,'&quot;');
                         tr.innerHTML=`<td>${start+i+1}</td><td style="max-width:260px">${a.title}</td>
                             <td style="font-size:12px;color:#aaa">${a.category}</td><td style="font-size:12px">${a.date}</td>
                             <td>${badge}</td><td style="text-align:center">${a.views||0}</td>
                             <td class="action-btns">
                                 <i class="fas fa-pen-to-square" title="Edit" onclick="openEditArt('${a.id}')"></i>
+                                <i class="fas fa-images" title="Kelola Galeri Foto" style="cursor:pointer;color:#6fcf97" onclick="openGaleriArtikelModal('${a.id}','${safeTitle}')"></i>
                                 <i class="fas fa-eye" title="Preview" style="cursor:pointer;color:#aaa" onclick="location.href='${viewerLink}'"></i>
                             </td>
                             <td class="action-btns"><i class="fas fa-trash-alt" onclick="deleteArt('${a.id}')"></i></td>`;
@@ -1608,13 +1717,13 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                     document.getElementById('artId').value='';
                     selectedGaleri={};
                     renderSelectedGaleri();
-                    document.getElementById('galeriGrid').innerHTML='<p style="color:#888;font-size:13px;text-align:center;padding:20px">Klik refresh untuk memuat foto dari galeri.</p>';
+                    const _gg=document.getElementById('galeriGrid');
+                    if(_gg) _gg.innerHTML='<p style="color:#888;font-size:13px;text-align:center;padding:20px">Klik refresh untuk memuat foto dari galeri.</p>';
                 }
                 function openAddModal(){
                     editingArtId=null;
                     document.getElementById('modalTitle').textContent='Tambah Artikel Baru';
                     clearArtForm();
-                    loadGaleriList();
                     document.getElementById('artModal').classList.add('active');
                 }
                 async function openEditArt(id){
@@ -1649,33 +1758,43 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                         if(found) selectedGaleri[gid]=found;
                     });
                     renderSelectedGaleri();
-                    renderGaleriGrid(allGaleri);
+                    if(document.getElementById('galeriGrid')) renderGaleriGrid(allGaleri);
                     document.getElementById('artModal').classList.add('active');
                 }
                 function closeArtModal(){ document.getElementById('artModal').classList.remove('active'); editingArtId=null; }
                 async function saveArticle(){
                     const title=document.getElementById('artTitle').value.trim();
                     const katId=document.getElementById('artCategory').value;
-                    if(!title||!katId) return showToast('Judul dan kategori wajib diisi.','error');
-                    const form=new FormData();
-                    form.append('title',              title);
-                    form.append('kategori_id',        katId);
-                    // Simpan nilai wilayah langsung (Jawa/Sumatra/dll) ke kolom location
-                    const wilayahFinal = document.getElementById('artWilayah').value;
-                    form.append('location', wilayahFinal);
-                    form.append('content_deskripsi',  document.getElementById('artContentDeskripsi').value.trim());
-                    form.append('content_jalur',      document.getElementById('artContentJalur').value.trim());
-                    form.append('content_daya_tarik', document.getElementById('artContentDayaTarik').value.trim());
-                    form.append('image',              document.getElementById('artImage').value.trim()||'Gambar/hero.jpg');
-                    form.append('maps_embed',         document.getElementById('artMaps').value.trim());
-                    form.append('info_json_raw',      document.getElementById('artInfo').value.trim());
-                    form.append('gallery_ids',        Object.keys(selectedGaleri).join(','));
-                    form.append('status',             document.getElementById('artStatus').value);
-                    let url=API+'add_article';
-                    if(editingArtId){ form.append('id',editingArtId); url=API+'update_article'; }
-                    const j=await(await fetch(url,{method:'POST',body:form})).json();
-                    if(j.success){ closeArtModal(); loadArticles(); showToast(j.message); }
-                    else showToast(j.message,'error');
+                    if(!title) return showToast('Judul artikel wajib diisi.','error');
+
+                    const saveBtn = document.querySelector('#artModal .btn-save');
+                    if(saveBtn){ saveBtn.disabled=true; saveBtn.textContent='Menyimpan...'; }
+
+                    try {
+                        const form=new FormData();
+                        form.append('title',              title);
+                        form.append('kategori_id',        katId);
+                        const wilayahFinal = document.getElementById('artWilayah').value;
+                        form.append('location', wilayahFinal);
+                        form.append('content_deskripsi',  document.getElementById('artContentDeskripsi').value.trim());
+                        form.append('content_jalur',      document.getElementById('artContentJalur').value.trim());
+                        form.append('content_daya_tarik', document.getElementById('artContentDayaTarik').value.trim());
+                        form.append('image',              document.getElementById('artImage').value.trim()||'Gambar/hero.jpg');
+                        form.append('maps_embed',         document.getElementById('artMaps').value.trim());
+                        form.append('info_json_raw',      document.getElementById('artInfo').value.trim());
+                        form.append('gallery_ids',        Object.keys(selectedGaleri).join(','));
+                        form.append('status',             document.getElementById('artStatus').value);
+                        let url=API+'add_article';
+                        if(editingArtId){ form.append('id',editingArtId); url=API+'update_article'; }
+                        const resp = await fetch(url,{method:'POST',body:form});
+                        const j = await resp.json();
+                        if(j.success){ closeArtModal(); loadArticles(); showToast(j.message||'Artikel berhasil disimpan.'); }
+                        else showToast(j.message||'Gagal menyimpan artikel.','error');
+                    } catch(err) {
+                        showToast('Error: '+err.message,'error');
+                    } finally {
+                        if(saveBtn){ saveBtn.disabled=false; saveBtn.textContent='Simpan Artikel'; }
+                    }
                 }
                 async function deleteArt(id){
                     if(!await showConfirm('Hapus Artikel', 'Tindakan ini tidak bisa dibatalkan.', '🗑️', 'Ya, Hapus')) return;
@@ -1687,19 +1806,21 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                 // ============================
                 // GALERI PICKER
                 // ============================
-                let allGaleri=[], selectedGaleri={};
 
                 async function loadGaleriList(){
                     if(allGaleri.length){ renderGaleriGrid(allGaleri); return; }
-                    const j=await(await fetch(API+'get_galeri_list')).json();
-                    if(j.success){ allGaleri=j.data; renderGaleriGrid(allGaleri); }
-                    else document.getElementById('galeriGrid').innerHTML='<p style="color:#e74c3c;font-size:13px;padding:10px">Gagal memuat galeri.</p>';
+                    try {
+                        const j=await(await fetch(API+'get_galeri_list')).json();
+                        if(j.success){ allGaleri=j.data; renderGaleriGrid(allGaleri); }
+                    } catch(e) { /* galeri grid tidak ditampilkan */ }
                 }
 
                 function renderGaleriGrid(list){
-                    const q=document.getElementById('galSearch').value.toLowerCase();
-                    const filtered=q ? list.filter(g=>(g.judul||'').toLowerCase().includes(q)||(g.lokasi||'').toLowerCase().includes(q)) : list;
                     const grid=document.getElementById('galeriGrid');
+                    if(!grid) return;
+                    const searchEl=document.getElementById('galSearch');
+                    const q=searchEl ? searchEl.value.toLowerCase() : '';
+                    const filtered=q ? list.filter(g=>(g.judul||'').toLowerCase().includes(q)||(g.lokasi||'').toLowerCase().includes(q)) : list;
                     if(!filtered.length){ grid.innerHTML='<p style="color:#888;font-size:13px;text-align:center;padding:20px">Tidak ada foto ditemukan.</p>'; return; }
                     grid.innerHTML=filtered.map(g=>{
                         const selected=selectedGaleri[g.id]?'outline:2px solid #6fcf97;':'';
@@ -1723,7 +1844,9 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                 function renderSelectedGaleri(){
                     const box=document.getElementById('galeriSelected');
                     const ids=Object.keys(selectedGaleri);
-                    document.getElementById('artGalleryIds').value=ids.join(',');
+                    const galleryInput=document.getElementById('artGalleryIds');
+                    if(galleryInput) galleryInput.value=ids.join(',');
+                    if(!box) return;
                     if(!ids.length){ box.innerHTML='<span style="color:#888;font-size:12px">Belum ada foto dipilih</span>'; return; }
                     box.innerHTML=ids.map(id=>{
                         const g=selectedGaleri[id];
@@ -1736,10 +1859,221 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                     }).join('');
                 }
 
-                document.getElementById('galSearch').addEventListener('input',()=>renderGaleriGrid(allGaleri));
+                const _galSearchEl=document.getElementById('galSearch');
+                if(_galSearchEl) _galSearchEl.addEventListener('input',()=>renderGaleriGrid(allGaleri));
+
+                // ============================================================
+                //  KELOLA GALERI FOTO ARTIKEL
+                // ============================================================
+                let _galArtId   = null;
+                let _galArtData = [];
+                let _galArtSel  = new Set();
+
+                async function openGaleriArtikelModal(artId, artTitle) {
+                    _galArtId  = artId;
+                    _galArtSel = new Set();
+                    document.getElementById('galArtSelectAll').checked = false;
+                    document.getElementById('galArtModalSubtitle').textContent = 'Memuat foto...';
+                    document.getElementById('galArtGrid').innerHTML =
+                        '<p style="color:#888;font-size:13px;text-align:center;padding:30px;grid-column:1/-1">' +
+                        '<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Memuat...</p>';
+                    document.getElementById('galArtEmpty').style.display = 'none';
+                    document.getElementById('galArtGrid').style.display  = 'grid';
+                    document.getElementById('galArtDeleteBtn').style.display = 'none';
+                    galArtUpdateCount();
+                    document.getElementById('galeriArtikelModal').classList.add('active');
+
+                    try {
+                        const j = await (await fetch(API + 'get_approved_galeri_by_artikel&artikel_id=' + encodeURIComponent(artId))).json();
+                        if (!j.success) { showToast(j.message || 'Gagal memuat galeri.', 'error'); return; }
+                        _galArtData = j.data.photos || [];
+                        const artJudul = j.data.title || artTitle || 'Artikel';
+                        document.getElementById('galArtModalSubtitle').textContent =
+                            artJudul + ' \u2014 ' + _galArtData.length + ' foto disetujui';
+                        renderGalArtGrid();
+                    } catch (e) {
+                        document.getElementById('galArtGrid').innerHTML =
+                            '<p style="color:#e74c3c;font-size:13px;text-align:center;padding:30px;grid-column:1/-1">Gagal memuat galeri.</p>';
+                    }
+                }
+
+                function closeGaleriArtikelModal() {
+                    document.getElementById('galeriArtikelModal').classList.remove('active');
+                    _galArtId = null; _galArtSel = new Set(); _galArtData = [];
+                }
+
+                function renderGalArtGrid() {
+                    const grid  = document.getElementById('galArtGrid');
+                    const empty = document.getElementById('galArtEmpty');
+                    if (!_galArtData.length) {
+                        grid.innerHTML = ''; grid.style.display = 'none';
+                        empty.style.display = 'block'; return;
+                    }
+                    grid.style.display = 'grid'; empty.style.display = 'none';
+                    grid.innerHTML = _galArtData.map(g => {
+                        const isSel   = _galArtSel.has(String(g.id));
+                        const caption = (g.judul || g.lokasi || '').replace(/"/g, '&quot;');
+                        return `<div class="gal-art-card${isSel ? ' selected' : ''}" id="galCard-${g.id}"
+                                    onclick="galArtToggleCard(${g.id})">
+                            <img src="${g.image_path}" alt="${caption}" onerror="this.src='Gambar/hero.jpg'" loading="lazy">
+                            <div class="gal-art-overlay">
+                                <div class="gal-art-check"><i class="fas fa-check"></i></div>
+                            </div>
+                            <div class="gal-art-cb">
+                                <input type="checkbox" id="galCb-${g.id}" ${isSel ? 'checked' : ''}
+                                    onclick="event.stopPropagation();galArtToggleCard(${g.id})">
+                            </div>
+                            ${caption ? `<div class="gal-art-caption">${caption}</div>` : ''}
+                        </div>`;
+                    }).join('');
+                    galArtUpdateCount();
+                }
+
+                function galArtToggleCard(id) {
+                    const sid = String(id);
+                    if (_galArtSel.has(sid)) _galArtSel.delete(sid);
+                    else                      _galArtSel.add(sid);
+                    const card = document.getElementById('galCard-' + id);
+                    const cb   = document.getElementById('galCb-'   + id);
+                    if (card) card.classList.toggle('selected', _galArtSel.has(sid));
+                    if (cb)   cb.checked = _galArtSel.has(sid);
+                    galArtUpdateCount();
+                }
+
+                function galArtToggleAll(checked) {
+                    _galArtSel = checked ? new Set(_galArtData.map(g => String(g.id))) : new Set();
+                    _galArtData.forEach(g => {
+                        const card = document.getElementById('galCard-' + g.id);
+                        const cb   = document.getElementById('galCb-'   + g.id);
+                        if (card) card.classList.toggle('selected', checked);
+                        if (cb)   cb.checked = checked;
+                    });
+                    galArtUpdateCount();
+                }
+
+                function galArtUpdateCount() {
+                    const n   = _galArtSel.size;
+                    const el  = document.getElementById('galArtSelCount');
+                    const btn = document.getElementById('galArtDeleteBtn');
+                    if (el)  el.textContent = n ? n + ' foto dipilih' : '';
+                    if (btn) btn.style.display = n ? 'inline-flex' : 'none';
+                }
+
+                async function galArtHapusSelected() {
+                    if (!_galArtSel.size) return;
+                    const n  = _galArtSel.size;
+                    const ok = await showConfirm(
+                        'Hapus ' + n + ' Foto dari Galeri',
+                        'Foto akan dilepas dari galeri artikel ini. File foto tidak akan dihapus.',
+                        '\ud83d\uddd1\ufe0f', 'Ya, Hapus'
+                    );
+                    if (!ok) return;
+                    const form = new FormData();
+                    form.append('artikel_id', _galArtId);
+                    form.append('galeri_ids', [..._galArtSel].join(','));
+                    const j = await (await fetch(API + 'remove_galeri_from_artikel', { method: 'POST', body: form })).json();
+                    if (j.success) {
+                        showToast(j.message);
+                        const removedIds = new Set([..._galArtSel].map(String));
+                        _galArtData = _galArtData.filter(g => !removedIds.has(String(g.id)));
+                        _galArtSel  = new Set();
+                        document.getElementById('galArtSelectAll').checked = false;
+                        document.getElementById('galArtModalSubtitle').textContent =
+                            document.getElementById('galArtModalSubtitle').textContent.replace(/\d+ foto/, _galArtData.length + ' foto');
+                        renderGalArtGrid();
+                    } else {
+                        showToast(j.message || 'Gagal menghapus foto.', 'error');
+                    }
+                }
 
                 loadArticles();
             </script>
+
+            <!-- Modal Kelola Galeri Foto Artikel -->
+            <div class="modal-overlay" id="galeriArtikelModal">
+                <div class="modal-box" style="width:760px;max-width:96vw;">
+                    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:18px">
+                        <div>
+                            <h4 style="margin:0 0 4px;font-size:17px">
+                                <i class="fas fa-images" style="color:#6fcf97;margin-right:8px"></i>Galeri Foto Artikel
+                            </h4>
+                            <p id="galArtModalSubtitle" style="margin:0;font-size:12px;color:#888">Memuat...</p>
+                        </div>
+                        <button onclick="closeGaleriArtikelModal()"
+                            style="flex-shrink:0;background:none;border:none;color:#aaa;font-size:22px;cursor:pointer;line-height:1;padding:2px 6px">&times;</button>
+                    </div>
+
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#aaa;cursor:pointer;user-select:none">
+                            <input type="checkbox" id="galArtSelectAll" onchange="galArtToggleAll(this.checked)"
+                                style="accent-color:#e74c3c;width:14px;height:14px">
+                            Pilih Semua
+                        </label>
+                        <span id="galArtSelCount" style="font-size:12px;color:#e74c3c;font-weight:600;min-width:90px"></span>
+                        <div style="flex:1"></div>
+                        <button id="galArtDeleteBtn" onclick="galArtHapusSelected()"
+                            style="display:none;align-items:center;gap:7px;padding:8px 18px;
+                                   background:#e74c3c;border:none;border-radius:8px;color:#fff;
+                                   font-family:'Poppins',sans-serif;font-size:13px;font-weight:600;
+                                   cursor:pointer;transition:opacity .2s"
+                            onmouseover="this.style.opacity='.8'" onmouseout="this.style.opacity='1'">
+                            <i class="fas fa-trash-alt"></i> Hapus dari Galeri
+                        </button>
+                    </div>
+
+                    <div id="galArtGrid"
+                        style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;
+                               max-height:420px;overflow-y:auto;
+                               background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.08);
+                               border-radius:10px;padding:12px;
+                               scrollbar-width:thin;scrollbar-color:#333 transparent"></div>
+
+                    <div id="galArtEmpty" style="display:none;text-align:center;padding:48px 20px;color:#666">
+                        <i class="fas fa-photo-video" style="font-size:36px;margin-bottom:12px;display:block;color:#444"></i>
+                        <p style="margin:0;font-size:13px">Belum ada foto yang disetujui di galeri artikel ini.</p>
+                    </div>
+
+                    <p style="margin:14px 0 0;font-size:11px;color:#555">
+                        <i class="fas fa-info-circle" style="margin-right:4px"></i>
+                        Menghapus foto di sini hanya melepas foto dari galeri artikel. File foto tidak ikut terhapus.
+                    </p>
+                    <div class="modal-btns" style="margin-top:16px">
+                        <button class="btn-cancel" onclick="closeGaleriArtikelModal()">Tutup</button>
+                    </div>
+                </div>
+            </div>
+
+            <style>
+            .gal-art-card {
+                position:relative;border-radius:8px;overflow:hidden;
+                aspect-ratio:1;cursor:pointer;
+                border:2px solid transparent;transition:border-color .18s,transform .15s;
+                background:#111;
+            }
+            .gal-art-card:hover { transform:scale(1.03); }
+            .gal-art-card.selected { border-color:#e74c3c; }
+            .gal-art-card img { width:100%;height:100%;object-fit:cover;display:block; }
+            .gal-art-overlay {
+                position:absolute;inset:0;background:rgba(231,76,60,.35);
+                display:flex;align-items:center;justify-content:center;
+                opacity:0;transition:opacity .18s;
+            }
+            .gal-art-card.selected .gal-art-overlay { opacity:1; }
+            .gal-art-check {
+                width:28px;height:28px;border-radius:50%;
+                background:#e74c3c;border:2px solid #fff;
+                display:flex;align-items:center;justify-content:center;
+                color:#fff;font-size:13px;
+            }
+            .gal-art-cb { position:absolute;top:5px;left:5px; }
+            .gal-art-cb input[type=checkbox] { accent-color:#e74c3c;width:15px;height:15px;cursor:pointer; }
+            .gal-art-caption {
+                position:absolute;bottom:0;left:0;right:0;
+                background:linear-gradient(transparent,rgba(0,0,0,.8));
+                padding:14px 6px 5px;font-size:10px;color:#ddd;
+                white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;
+            }
+            </style>
 
             <?php /* ---- MODE: SETTINGS ---- */
             elseif ($mode === 'settings'): ?>
@@ -2337,7 +2671,7 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                             <th onclick="usulSortBy('pesan')" style="cursor:pointer;user-select:none">Pesan Usulan <span id="usulsort-pesan" style="font-size:10px;color:#666">⇅</span></th>
                             <th onclick="usulSortBy('user')" style="width:160px;cursor:pointer;user-select:none">Pengguna <span id="usulsort-user" style="font-size:10px;color:#666">⇅</span></th>
                             <th onclick="usulSortBy('date')" style="width:140px;cursor:pointer;user-select:none">Tanggal <span id="usulsort-date" style="font-size:10px;color:#aaa">↓</span></th>
-                            <th style="width:80px">Aksi</th>
+                            <th style="width:120px">Aksi</th>
                         </tr>
                     </thead>
                     <tbody id="usulTableBody">
@@ -2435,7 +2769,14 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                             <td style="font-size:13px">${u.pesan.replace(/</g,'&lt;')}</td>
                             <td style="color:var(--text-secondary);font-size:13px">${u.username.replace(/</g,'&lt;')}</td>
                             <td style="color:#555;font-size:12px">${u.tanggal}</td>
-                            <td class="action-btns"><i class="fas fa-trash-alt" onclick="deleteUsulRow(${u.id}, this)" title="Hapus"></i></td>
+                            <td class="action-btns" style="display:flex;gap:8px;align-items:center">
+                                <button onclick="buatArtikelDariUsul(${u.id}, ${JSON.stringify(u.pesan.replace(/</g,'&lt;'))})"
+                                    title="Buat Artikel dari Usulan"
+                                    style="background:rgba(76,175,80,.15);border:1px solid rgba(76,175,80,.4);color:#6fcf97;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:11px;font-family:'Poppins',sans-serif;white-space:nowrap">
+                                    <i class="fas fa-plus-circle" style="margin-right:4px"></i>Buat Artikel
+                                </button>
+                                <i class="fas fa-trash-alt" onclick="deleteUsulRow(${u.id}, this)" title="Hapus" style="cursor:pointer"></i>
+                            </td>
                         </tr>`).join('');
                     }
                     document.getElementById('usulPaginInfo').textContent = `${usulFiltered.length} usulan`;
@@ -2459,6 +2800,89 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
                     }
                 };
 
+                // ── Buat Artikel dari Usulan ──
+                let _usulIdForArtikel = null;
+                let _usulKategoriLoaded = false;
+
+                async function loadUsulKategori() {
+                    if (_usulKategoriLoaded) return;
+                    try {
+                        const j = await (await fetch('dashboardAdmin.php?mode=api&action=get_articles')).json();
+                        if (j.success && Array.isArray(j.categories) && j.categories.length) {
+                            const sel = document.getElementById('usulArtKategori');
+                            sel.innerHTML = '<option value="">— Pilih Kategori —</option>' +
+                                j.categories.map(c => `<option value="${c.id}">${c.nama}</option>`).join('');
+                            _usulKategoriLoaded = true;
+                        }
+                    } catch(e) { /* biarkan dropdown kosong jika gagal */ }
+                }
+
+                window.buatArtikelDariUsul = function(id, pesan) {
+                    _usulIdForArtikel = id;
+                    document.getElementById('usulArtDeskripsi').value = pesan;
+                    document.getElementById('usulArtTitle').value     = '';
+                    document.getElementById('usulArtKategori').value  = '';
+                    document.getElementById('usulArtStatus').value    = 'draft';
+                    document.getElementById('usulArtModal').classList.add('active');
+                    loadUsulKategori();
+                };
+
+                document.getElementById('usulArtForm').addEventListener('submit', async function(e) {
+                    e.preventDefault();
+                    const title      = document.getElementById('usulArtTitle').value.trim();
+                    const kategoriId = document.getElementById('usulArtKategori').value.trim();
+                    const status     = document.getElementById('usulArtStatus').value;
+                    const deskripsi  = document.getElementById('usulArtDeskripsi').value.trim();
+
+                    if (!title)      { showUsulToast('Judul artikel wajib diisi.'); return; }
+                    if (!kategoriId) { showUsulToast('Kategori wajib dipilih.'); return; }
+
+                    const fd = new FormData();
+                    fd.append('title',              title);
+                    fd.append('kategori_id',        kategoriId);
+                    fd.append('location',           '');
+                    fd.append('status',             status);
+                    fd.append('content_deskripsi',  deskripsi);
+                    fd.append('content_jalur',      '');
+                    fd.append('content_daya_tarik', '');
+                    fd.append('image',              'Gambar/hero.jpg');
+                    fd.append('maps_embed',         '');
+                    fd.append('info_json_raw',      '');
+                    fd.append('gallery_ids',        '');
+
+                    const saveBtn = document.getElementById('usulArtSaveBtn');
+                    saveBtn.disabled = true;
+                    saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Menyimpan...';
+
+                    try {
+                        const j = await (await fetch('dashboardAdmin.php?mode=api&action=add_article', {method:'POST', body:fd})).json();
+                        if (j.success) {
+                            document.getElementById('usulArtModal').classList.remove('active');
+                            showUsulToast('Artikel berhasil dibuat' + (status === 'published' ? ' dan diterbitkan!' : ' sebagai draf!'));
+                            // Hapus usulan setelah artikel dibuat
+                            if (_usulIdForArtikel) {
+                                const df = new FormData();
+                                df.append('id', _usulIdForArtikel);
+                                await fetch('dashboardAdmin.php?mode=api&action=delete_usul', {method:'POST', body:df});
+                                const idx = usulData.findIndex(u => u.id == _usulIdForArtikel);
+                                if (idx !== -1) usulData.splice(idx, 1);
+                                usulApplyFilter();
+                            }
+                        } else {
+                            showUsulToast(j.message || 'Gagal membuat artikel.');
+                        }
+                    } catch(err) {
+                        showUsulToast('Error: ' + err.message);
+                    } finally {
+                        saveBtn.disabled = false;
+                        saveBtn.innerHTML = '<i class="fas fa-plus-circle" style="margin-right:6px"></i>Buat Artikel';
+                    }
+                });
+
+                document.getElementById('usulArtCancelBtn').addEventListener('click', () => {
+                    document.getElementById('usulArtModal').classList.remove('active');
+                });
+
                 document.getElementById('usulPerPage').addEventListener('change', usulApplyFilter);
                 document.getElementById('usulPrev').addEventListener('click', ()=>{ if(usulPage>1){usulPage--;renderUsul();} });
                 document.getElementById('usulNext').addEventListener('click', ()=>{ usulPage++;renderUsul(); });
@@ -2471,186 +2895,305 @@ $pageTitle = $titles[$mode] ?? 'Dashboard';
             })();
             </script>
 
-            <?php elseif ($mode === 'broadcast'): ?>
-
-            <!-- ===== MODE: KIRIM NOTIFIKASI ===== -->
-            <div class="admin-title" style="font-size:26px;font-weight:600;margin-bottom:24px">
-                <i class="fas fa-bell" style="color:var(--accent-green);margin-right:10px"></i>Kirim Notifikasi ke Pengguna
-            </div>
-
-            <!-- Form Kirim -->
-            <div class="section-card" style="margin-bottom:28px">
-                <h3 style="font-size:17px;font-weight:600;margin-bottom:20px">📢 Buat Notifikasi Baru</h3>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-                    <div class="form-group" style="grid-column:1/-1">
-                        <label>Judul Notifikasi</label>
-                        <input type="text" id="bcJudul" placeholder="Contoh: Fitur baru telah hadir!" class="form-group input" style="width:100%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 14px;color:#fff;font-family:'Poppins',sans-serif;outline:none">
-                    </div>
-                    <div class="form-group" style="grid-column:1/-1">
-                        <label>Isi Pesan</label>
-                        <textarea id="bcPesan" rows="4" placeholder="Tulis pesan notifikasi di sini..." style="width:100%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 14px;color:#fff;font-family:'Poppins',sans-serif;outline:none;resize:vertical"></textarea>
-                    </div>
-                    <div class="form-group">
-                        <label>Tipe Notifikasi</label>
-                        <select id="bcTipe" style="width:100%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 14px;color:#fff;font-family:'Poppins',sans-serif;outline:none">
-                            <option value="info">📢 Info Umum</option>
-                            <option value="artikel_baru">📰 Artikel Baru</option>
-                            <option value="sistem">⚙️ Update Sistem</option>
-                            <option value="populer">🔥 Konten Populer</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Kirim ke</label>
-                        <select id="bcTarget" style="width:100%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 14px;color:#fff;font-family:'Poppins',sans-serif;outline:none">
-                            <option value="semua">👥 Semua Pengguna Aktif</option>
-                            <option value="notif_sistem">⚙️ Yang aktifkan Notif Sistem</option>
-                            <option value="notif_artikel_baru">📰 Yang aktifkan Notif Artikel Baru</option>
-                        </select>
-                    </div>
-                </div>
-                <div style="display:flex;align-items:center;gap:14px;margin-top:18px">
-                    <button onclick="sendBroadcast()" id="bcBtn"
-                        style="background:var(--accent-green);color:#fff;border:none;padding:11px 28px;border-radius:8px;cursor:pointer;font-weight:600;font-family:'Poppins',sans-serif;font-size:14px;display:flex;align-items:center;gap:8px;transition:.2s">
-                        <i class="fas fa-paper-plane"></i> Kirim Sekarang
-                    </button>
-                    <span id="bcStatus" style="font-size:13px;color:#aaa"></span>
+            <!-- Modal: Buat Artikel dari Usulan -->
+            <div class="modal-overlay" id="usulArtModal">
+                <div class="modal-box" style="width:580px">
+                    <h4><i class="fas fa-plus-circle" style="color:#6fcf97;margin-right:8px"></i>Buat Artikel dari Usulan</h4>
+                    <p style="color:#888;font-size:13px;margin:-10px 0 18px">Isi judul dan kategori, lalu simpan. Detail lainnya bisa dilengkapi di Manajemen Artikel.</p>
+                    <form id="usulArtForm">
+                        <div class="form-group">
+                            <label>Judul Artikel <span style="color:#e74c3c">*</span></label>
+                            <input type="text" id="usulArtTitle" placeholder="Masukkan judul artikel..." required>
+                        </div>
+                        <div class="form-group">
+                            <label>Kategori <span style="color:#e74c3c">*</span></label>
+                            <select id="usulArtKategori" required>
+                                <option value="">— Memuat kategori... —</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>📝 Deskripsi / Isi dari Usulan</label>
+                            <textarea id="usulArtDeskripsi" rows="5" placeholder="Konten dari pesan usulan..."></textarea>
+                            <small style="color:#666;font-size:11px">Konten ini akan masuk ke bagian <em>Deskripsi Pengenalan</em>. Bisa diedit lebih lanjut di Manajemen Artikel.</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Status</label>
+                            <select id="usulArtStatus">
+                                <option value="draft">Draf (Simpan dulu, terbitkan nanti)</option>
+                                <option value="published">Terbit Langsung</option>
+                            </select>
+                        </div>
+                        <p style="font-size:11px;color:#666;margin-top:4px">
+                            <i class="fas fa-info-circle" style="margin-right:4px"></i>
+                            Usulan akan otomatis dihapus setelah artikel berhasil dibuat.
+                        </p>
+                        <div class="modal-btns" style="margin-top:16px">
+                            <button type="button" id="usulArtCancelBtn" class="btn-cancel">Batal</button>
+                            <button type="submit" id="usulArtSaveBtn" class="btn-save">
+                                <i class="fas fa-plus-circle" style="margin-right:6px"></i>Buat Artikel
+                            </button>
+                        </div>
+                    </form>
                 </div>
             </div>
 
-            <!-- Riwayat Broadcast -->
-            <div class="section-card">
-                <div class="section-header">
-                    <h3 style="font-size:17px;font-weight:600">🕓 Riwayat Broadcast</h3>
-                    <button onclick="loadBroadcasts()" style="background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:8px 16px;color:#ccc;cursor:pointer;font-size:13px;font-family:'Poppins',sans-serif">
-                        <i class="fas fa-sync-alt"></i> Refresh
-                    </button>
+            <?php elseif ($mode === 'statistik'):
+            $jVisitor  = json_encode($stat_visitor,       JSON_UNESCAPED_UNICODE);
+            $jUserBln  = json_encode($stat_user_bulan,    JSON_UNESCAPED_UNICODE);
+            $jViewsKat = json_encode($stat_views_kat,     JSON_UNESCAPED_UNICODE);
+            $jViewsHr  = json_encode($stat_views_harian,  JSON_UNESCAPED_UNICODE);
+            $jUsulan   = json_encode($stat_usulan_bln,    JSON_UNESCAPED_UNICODE);
+            $jUser7    = json_encode($stat_user_7hari,    JSON_UNESCAPED_UNICODE);
+            ?>
+
+            <!-- ====== HEADER HALAMAN ====== -->
+            
+
+            <!-- ====== KARTU RINGKASAN ====== -->
+            <div class="stat-grid-8">
+                <?php
+                try { $statOnline = (int)$pdo->query("SELECT COUNT(DISTINCT user_id) FROM user_sessions WHERE last_seen >= DATE_SUB(NOW(), INTERVAL 15 MINUTE)")->fetchColumn(); } catch(\Exception $e){ $statOnline=0; }
+                ?>
+                <?php
+                $kunjunganHariIni     = (int)($stat_data['kunjungan_hari_ini'] ?? 0);
+                $uniqueVisitorHariIni = (int)($stat_data['unique_visitor_hari_ini'] ?? 0);
+                $totalUser            = (int)($stat_data['total_user'] ?? 0);
+                $userBanned           = (int)($stat_data['user_banned'] ?? 0);
+                $userHariIni          = (int)($stat_data['user_hari_ini'] ?? 0);
+                $totalArtikel         = (int)($stat_data['total_artikel'] ?? 0);
+                $artikelDraft         = (int)($stat_data['artikel_draft'] ?? 0);
+                $totalViews           = (int)($stat_data['total_views_artikel'] ?? 0);
+                $totalGaleri          = (int)($stat_data['total_galeri'] ?? 0);
+                $totalLikes           = (int)($stat_data['total_likes_galeri'] ?? 0);
+                $totalUsulan          = (int)($stat_data['total_usulan'] ?? 0);
+                ?>
+                <?php
+                $tip1 = "📊 Total kunjungan: <b>".number_format($kunjunganHariIni)."</b><br>👤 Pengunjung unik: <b>".number_format($uniqueVisitorHariIni)."</b>";
+                $tip2 = "👥 Total terdaftar: <b>".number_format($totalUser)."</b><br>🚫 Dibanned: <b>".number_format($userBanned)."</b><br>✅ Aktif: <b>".number_format($totalUser - $userBanned)."</b>";
+                $tip3 = "🆕 Daftar hari ini: <b>".number_format($userHariIni)."</b><br>📅 Dari total: <b>".number_format($totalUser)."</b> user";
+                $tip4 = "🟢 Aktif dalam 15 menit terakhir: <b>".number_format($statOnline)."</b>";
+                $tip5 = "📰 Terbit: <b>".number_format($totalArtikel)."</b><br>📝 Draft: <b>".number_format($artikelDraft)."</b><br>📦 Total: <b>".number_format($totalArtikel + $artikelDraft)."</b>";
+                $avgViews = $totalArtikel > 0 ? number_format(round($totalViews / $totalArtikel)) : '0';
+                $tip6 = "🔥 Total views: <b>".number_format($totalViews)."</b><br>📊 Rata-rata per artikel: <b>$avgViews</b>";
+                $tip7 = "🖼️ Total foto: <b>".number_format($totalGaleri)."</b><br>❤️ Total likes: <b>".number_format($totalLikes)."</b>";
+                $tip8 = "💡 Total usulan masuk: <b>".number_format($totalUsulan)."</b>";
+                ?>
+                <div class="scard hl" data-tip="<?= htmlspecialchars($tip1) ?>">
+                    <div class="scard-ico g"><i class="fas fa-eye"></i></div>
+                    <div><div class="scard-val"><?= number_format($kunjunganHariIni) ?></div><div class="scard-lbl">Kunjungan Hari Ini</div></div>
                 </div>
-                <table style="margin-top:8px">
-                    <thead>
-                        <tr>
-                            <th style="width:40px">No</th>
-                            <th>Judul</th>
-                            <th style="width:110px">Tipe</th>
-                            <th style="width:160px">Target</th>
-                            <th style="width:80px;text-align:center">Terkirim</th>
-                            <th style="width:140px">Waktu</th>
-                            <th style="width:60px">Aksi</th>
-                        </tr>
-                    </thead>
-                    <tbody id="bcTableBody">
-                        <tr><td colspan="7" style="text-align:center;color:#aaa;padding:30px">Memuat...</td></tr>
-                    </tbody>
-                </table>
+                <div class="scard" data-tip="<?= htmlspecialchars($tip2) ?>">
+                    <div class="scard-ico b"><i class="fas fa-users"></i></div>
+                    <div><div class="scard-val"><?= number_format($totalUser) ?></div><div class="scard-lbl">Total User</div></div>
+                </div>
+                <div class="scard" data-tip="<?= htmlspecialchars($tip3) ?>">
+                    <div class="scard-ico g"><i class="fas fa-user-plus"></i></div>
+                    <div><div class="scard-val"><?= number_format($userHariIni) ?></div><div class="scard-lbl">User Baru Hari Ini</div></div>
+                </div>
+                <div class="scard" data-tip="<?= htmlspecialchars($tip4) ?>">
+                    <div class="scard-ico a"><i class="fas fa-wifi"></i></div>
+                    <div><div class="scard-val"><?= number_format($statOnline) ?></div><div class="scard-lbl">Online Sekarang</div></div>
+                </div>
+                <div class="scard" data-tip="<?= htmlspecialchars($tip5) ?>">
+                    <div class="scard-ico a"><i class="fas fa-newspaper"></i></div>
+                    <div><div class="scard-val"><?= number_format($totalArtikel) ?></div><div class="scard-lbl">Artikel Terbit</div></div>
+                </div>
+                <div class="scard" data-tip="<?= htmlspecialchars($tip6) ?>">
+                    <div class="scard-ico b"><i class="fas fa-fire-alt"></i></div>
+                    <div><div class="scard-val"><?= number_format($totalViews) ?></div><div class="scard-lbl">Total Views Artikel</div></div>
+                </div>
+                <div class="scard" data-tip="<?= htmlspecialchars($tip7) ?>">
+                    <div class="scard-ico p"><i class="fas fa-image"></i></div>
+                    <div><div class="scard-val"><?= number_format($totalGaleri) ?></div><div class="scard-lbl">Foto Galeri</div></div>
+                </div>
+                <div class="scard" data-tip="<?= htmlspecialchars($tip8) ?>">
+                    <div class="scard-ico r"><i class="fas fa-lightbulb"></i></div>
+                    <div><div class="scard-val"><?= number_format($totalUsulan) ?></div><div class="scard-lbl">Usul User</div></div>
+                </div>
+            </div>
+
+            <!-- ====== ROW 1: Pengunjung 30hr + User 7hr ====== -->
+            <div class="charts-r2">
+                <div class="ccrd">
+                    <h3><i class="fas fa-chart-area"></i> Pengunjung Website <span class="rng">30 hari terakhir</span></h3>
+                    <canvas id="chVisitor"></canvas>
+                    <?php if (count($stat_visitor) === 0): ?>
+                    <div class="stat-empty" style="padding:10px 0 0"><i class="fas fa-database"></i>Data belum tersedia. Import <code>statistik_tables.sql</code> dan panggil <code>visitor_tracker.php</code> di halaman publik.</div>
+                    <?php endif; ?>
+                </div>
+                <div class="ccrd">
+                    <h3><i class="fas fa-user-clock"></i> User Baru <span class="rng">7 hari</span></h3>
+                    <canvas id="chUser7"></canvas>
+                </div>
+            </div>
+
+            <!-- ====== ROW 2: Views harian + User/bulan + Usulan ====== -->
+            <div class="charts-r3">
+                <div class="ccrd">
+                    <h3><i class="fas fa-chart-line"></i> Views Artikel <span class="rng">30 hari</span></h3>
+                    <canvas id="chViewsHr"></canvas>
+                    <?php if (count($stat_views_harian) === 0): ?>
+                    <div class="stat-empty" style="padding:10px 0 0"><i class="fas fa-database"></i>Belum ada data views.</div>
+                    <?php endif; ?>
+                </div>
+                <div class="ccrd">
+                    <h3><i class="fas fa-users"></i> User Baru <span class="rng">12 bulan</span></h3>
+                    <canvas id="chUserBln"></canvas>
+                </div>
+                <div class="ccrd">
+                    <h3><i class="fas fa-lightbulb"></i> Usulan <span class="rng">6 bulan</span></h3>
+                    <canvas id="chUsulan"></canvas>
+                    <?php if (count($stat_usulan_bln) === 0): ?>
+                    <div class="stat-empty" style="padding:10px 0 0"><i class="fas fa-database"></i>Belum ada usulan.</div>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <!-- ====== ROW 3: Top artikel + Donut kategori ====== -->
+            <div class="charts-r2">
+                <div class="section-card" style="margin-bottom:0">
+                    <h3 style="font-size:16px;font-weight:600;margin-bottom:18px;display:flex;align-items:center;gap:8px">
+                        <i class="fas fa-trophy" style="color:#4CAF50"></i> Artikel Terpopuler <span class="rng">by views</span>
+                    </h3>
+                    <?php if (count($stat_top_artikel) > 0):
+                        $maxV = max(array_column($stat_top_artikel,'views')) ?: 1; ?>
+                    <table class="stat-tbl">
+                        <thead><tr><th width="40">#</th><th>Judul Artikel</th><th>Kategori</th><th>Views</th></tr></thead>
+                        <tbody>
+                        <?php foreach ($stat_top_artikel as $i => $a):
+                            $rk = $i===0?'gold':($i===1?'silver':($i===2?'bronze':''));
+                            $bw = round(($a['views']/$maxV)*110);
+                        ?>
+                            <tr>
+                                <td><span class="rk <?= $rk ?>"><?= $i+1 ?></span></td>
+                                <td><?= htmlspecialchars(mb_strimwidth($a['title'],0,52,'…')) ?></td>
+                                <td style="font-size:12px;color:#AAA"><?= htmlspecialchars($a['kategori']??'-') ?></td>
+                                <td><div class="vbar-w"><div class="vbar" style="width:<?= $bw ?>px"></div><span><?= number_format($a['views']) ?></span></div></td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                    <?php else: ?>
+                    <div class="stat-empty"><i class="fas fa-newspaper"></i>Belum ada artikel terbit.</div>
+                    <?php endif; ?>
+                </div>
+                <div class="ccrd" style="display:flex;flex-direction:column">
+                    <h3><i class="fas fa-chart-pie"></i> Views per Kategori</h3>
+                    <?php if (count($stat_views_kat) > 0): ?>
+                    <canvas id="chKategori" style="flex:1;max-height:300px"></canvas>
+                    <?php else: ?>
+                    <div class="stat-empty"><i class="fas fa-tags"></i>Belum ada kategori.</div>
+                    <?php endif; ?>
+                </div>
             </div>
 
             <script>
             (function(){
-                const API_BC = 'dashboardAdmin.php?mode=api&action=';
+                Chart.defaults.color = '#AAA';
+                Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
+                Chart.defaults.font.family = 'Poppins';
+                Chart.defaults.font.size   = 11;
 
-                const tipeLabel = {
-                    info:         '📢 Info',
-                    artikel_baru: '📰 Artikel Baru',
-                    sistem:       '⚙️ Sistem',
-                    populer:      '🔥 Populer',
-                };
-                const targetLabel = {
-                    semua:              '👥 Semua User',
-                    notif_sistem:       '⚙️ Notif Sistem',
-                    notif_artikel_baru: '📰 Notif Artikel',
-                };
+                const G='#4CAF50', G2='rgba(76,175,80,.15)';
+                const B='#64B5F6', B2='rgba(100,181,246,.15)';
+                const AM='#FFD54F', RE='#EF9A9A', PU='#CE93D8';
 
-                async function loadBroadcasts() {
-                    const tbody = document.getElementById('bcTableBody');
-                    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#aaa;padding:20px">Memuat...</td></tr>';
-                    try {
-                        const j = await (await fetch(API_BC + 'get_broadcasts')).json();
-                        if (!j.success || !j.data.length) {
-                            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#aaa;padding:30px">Belum ada riwayat broadcast.</td></tr>';
-                            return;
-                        }
-                        tbody.innerHTML = j.data.map((b, i) => `<tr>
-                            <td style="color:#555">${i+1}</td>
-                            <td style="font-weight:500;max-width:260px">${b.judul.replace(/</g,'&lt;')}</td>
-                            <td style="font-size:12px">${tipeLabel[b.tipe] || b.tipe}</td>
-                            <td style="font-size:12px;color:#aaa">${targetLabel[b.target] || b.target}</td>
-                            <td style="text-align:center;font-weight:600;color:var(--accent-green)">${b.total_kirim}</td>
-                            <td style="font-size:12px;color:#666">${b.tanggal}</td>
-                            <td class="action-btns">
-                                <i class="fas fa-trash-alt" title="Hapus" data-id="${b.id}" onclick="deleteBroadcast(${b.id})"></i>
-                            </td>
-                        </tr>`).join('');
-                    } catch(e) {
-                        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#e74c3c;padding:20px">Gagal memuat data.</td></tr>';
+                const dV   = <?= $jVisitor ?>;
+                const dUB  = <?= $jUserBln ?>;
+                const dVK  = <?= $jViewsKat ?>;
+                const dVH  = <?= $jViewsHr ?>;
+                const dU   = <?= $jUsulan ?>;
+                const dU7  = <?= $jUser7 ?>;
+
+                // Helper tooltip style
+                const tooltipOpts = {
+                    enabled: true,
+                    backgroundColor: 'rgba(20,20,20,.92)',
+                    titleColor: '#fff',
+                    bodyColor: '#ccc',
+                    borderColor: 'rgba(255,255,255,.12)',
+                    borderWidth: 1,
+                    padding: 10,
+                    cornerRadius: 8,
+                    titleFont: { family: 'Poppins', size: 12, weight: '600' },
+                    bodyFont: { family: 'Poppins', size: 12 },
+                    displayColors: true,
+                    boxWidth: 10,
+                    boxHeight: 10,
+                    callbacks: {
+                        label: ctx => ` ${ctx.dataset.label || ctx.label}: ${Number(ctx.parsed.y ?? ctx.parsed ?? 0).toLocaleString('id-ID')}`
                     }
+                };
+                const tooltipDoughnut = {
+                    ...tooltipOpts,
+                    callbacks: {
+                        label: ctx => ` ${ctx.label}: ${Number(ctx.parsed).toLocaleString('id-ID')} views`
+                    }
+                };
+
+                // Pengunjung 30 hari
+                if (document.getElementById('chVisitor')) {
+                    new Chart(document.getElementById('chVisitor'), {
+                        type:'line',
+                        data:{ labels:dV.length?dV.map(r=>r.tgl):[''],
+                            datasets:[
+                                {label:'Total Kunjungan',data:dV.length?dV.map(r=>r.total_kunjungan):[0],borderColor:G,backgroundColor:G2,fill:true,tension:.4,pointRadius:3,pointHoverRadius:6},
+                                {label:'Pengunjung Unik', data:dV.length?dV.map(r=>r.unique_visitor):[0], borderColor:B,backgroundColor:B2,fill:true,tension:.4,pointRadius:3,pointHoverRadius:6}
+                            ]},
+                        options:{responsive:true,maintainAspectRatio:true,interaction:{mode:'index',intersect:false},plugins:{legend:{position:'top',labels:{boxWidth:10}},tooltip:tooltipOpts},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+                    });
                 }
 
-                window.sendBroadcast = async function() {
-                    const judul  = document.getElementById('bcJudul').value.trim();
-                    const pesan  = document.getElementById('bcPesan').value.trim();
-                    const tipe   = document.getElementById('bcTipe').value;
-                    const target = document.getElementById('bcTarget').value;
-                    const status = document.getElementById('bcStatus');
-                    const btn    = document.getElementById('bcBtn');
+                // User baru 7 hari
+                if (document.getElementById('chUser7')) {
+                    new Chart(document.getElementById('chUser7'), {
+                        type:'bar',
+                        data:{ labels:dU7.length?dU7.map(r=>r.hari):['Sen','Sel','Rab','Kam','Jum','Sab','Min'],
+                            datasets:[{label:'User Baru',data:dU7.length?dU7.map(r=>r.total):[0,0,0,0,0,0,0],backgroundColor:'rgba(76,175,80,.55)',borderColor:G,borderWidth:1,borderRadius:4}]},
+                        options:{responsive:true,maintainAspectRatio:true,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:tooltipOpts},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+                    });
+                }
 
-                    if (!judul || !pesan) {
-                        status.textContent = '⚠️ Judul dan pesan tidak boleh kosong.';
-                        status.style.color = '#e74c3c';
-                        return;
-                    }
+                // Views artikel harian
+                if (document.getElementById('chViewsHr')) {
+                    new Chart(document.getElementById('chViewsHr'), {
+                        type:'line',
+                        data:{ labels:dVH.length?dVH.map(r=>r.tgl):[''],
+                            datasets:[{label:'Views',data:dVH.length?dVH.map(r=>r.total):[0],borderColor:AM,backgroundColor:'rgba(255,213,79,.1)',fill:true,tension:.4,pointRadius:3,pointHoverRadius:6}]},
+                        options:{responsive:true,maintainAspectRatio:true,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:tooltipOpts},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+                    });
+                }
 
-                    if (!await showConfirm(
-                        'Kirim Notifikasi',
-                        `Notifikasi "${judul}" akan dikirim ke: ${targetLabel[target]}. Lanjutkan?`,
-                        '📢', 'Ya, Kirim'
-                    )) return;
+                // User per bulan
+                if (document.getElementById('chUserBln')) {
+                    new Chart(document.getElementById('chUserBln'), {
+                        type:'bar',
+                        data:{ labels:dUB.map(r=>r.bln),
+                            datasets:[{label:'User Baru',data:dUB.map(r=>r.total),backgroundColor:'rgba(100,181,246,.55)',borderColor:B,borderWidth:1,borderRadius:4}]},
+                        options:{responsive:true,maintainAspectRatio:true,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:tooltipOpts},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+                    });
+                }
 
-                    btn.disabled = true;
-                    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Mengirim...';
-                    status.textContent = '';
+                // Usulan per bulan
+                if (document.getElementById('chUsulan')) {
+                    new Chart(document.getElementById('chUsulan'), {
+                        type:'bar',
+                        data:{ labels:dU.length?dU.map(r=>r.bln):[''],
+                            datasets:[{label:'Usulan',data:dU.length?dU.map(r=>r.total):[0],backgroundColor:'rgba(239,154,154,.55)',borderColor:RE,borderWidth:1,borderRadius:4}]},
+                        options:{responsive:true,maintainAspectRatio:true,interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},tooltip:tooltipOpts},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+                    });
+                }
 
-                    const fd = new FormData();
-                    fd.append('judul', judul);
-                    fd.append('pesan', pesan);
-                    fd.append('tipe', tipe);
-                    fd.append('target', target);
-
-                    try {
-                        const j = await (await fetch(API_BC + 'send_broadcast', {method:'POST', body:fd})).json();
-                        if (j.success) {
-                            status.textContent = '✅ ' + j.message;
-                            status.style.color = '#27ae60';
-                            document.getElementById('bcJudul').value = '';
-                            document.getElementById('bcPesan').value = '';
-                            loadBroadcasts();
-                        } else {
-                            status.textContent = '❌ ' + (j.message || 'Gagal mengirim.');
-                            status.style.color = '#e74c3c';
-                        }
-                    } catch(e) {
-                        status.textContent = '❌ Koneksi gagal.';
-                        status.style.color = '#e74c3c';
-                    }
-
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="fas fa-paper-plane"></i> Kirim Sekarang';
-                };
-
-                window.deleteBroadcast = async function(id) {
-                    if (!await showConfirm('Hapus Broadcast', 'Semua notifikasi terkait juga akan dihapus.', '🗑️', 'Ya, Hapus')) return;
-                    const fd = new FormData(); fd.append('id', id);
-                    const j = await (await fetch(API_BC + 'delete_broadcast', {method:'POST', body:fd})).json();
-                    if (j.success) {
-                        loadBroadcasts();
-                        const t = document.getElementById('toast');
-                        t.textContent = 'Broadcast dihapus.';
-                        t.className = 'toast show';
-                        setTimeout(() => t.className = 'toast', 3000);
-                    } else {
-                        alert('Gagal: ' + (j.message || ''));
-                    }
-                };
-
-                loadBroadcasts();
+                // Views per kategori (Doughnut)
+                if (dVK.length && document.getElementById('chKategori')) {
+                    const pal=[G,B,AM,RE,PU,'#80DEEA','#A5D6A7','#FFCC02'];
+                    new Chart(document.getElementById('chKategori'), {
+                        type:'doughnut',
+                        data:{ labels:dVK.map(r=>r.nama),
+                            datasets:[{data:dVK.map(r=>r.total_views),backgroundColor:pal,borderColor:'#000',borderWidth:2}]},
+                        options:{responsive:true,maintainAspectRatio:true,cutout:'62%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:10}},tooltip:tooltipDoughnut}}
+                    });
+                }
             })();
             </script>
 
@@ -2702,6 +3245,53 @@ function openFotoLightbox(src, caption, artikelId) {
     document.getElementById('confirmModal').addEventListener('click', function(e) {
         if (e.target === this) closeConfirm();
     });
+</script>
+
+<!-- ===== TOOLTIP GLOBAL SCARD ===== -->
+<div id="scardTooltipGlobal"></div>
+<script>
+(function(){
+    const tip = document.getElementById('scardTooltipGlobal');
+    let active = null;
+
+    document.querySelectorAll('.scard[data-tip]').forEach(card => {
+        card.addEventListener('mouseenter', function(e){
+            active = this;
+            tip.innerHTML = this.dataset.tip;
+            tip.style.opacity = '1';
+            positionTip(e);
+        });
+        card.addEventListener('mousemove', positionTip);
+        card.addEventListener('mouseleave', function(){
+            active = null;
+            tip.style.opacity = '0';
+        });
+    });
+
+    function positionTip(e) {
+        const offset = 14;
+        const tw = tip.offsetWidth, th = tip.offsetHeight;
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const margin = 8;
+
+        // Default: kanan-bawah kursor
+        let x = e.clientX + offset;
+        let y = e.clientY + offset;
+
+        // Keluar kanan → geser ke kiri kursor
+        if (x + tw + margin > vw) x = e.clientX - tw - offset;
+        // Masih keluar kiri → paksa nempel kiri viewport
+        if (x < margin) x = margin;
+
+        // Keluar bawah → geser ke atas kursor
+        if (y + th + margin > vh) y = e.clientY - th - offset;
+        // Masih keluar atas → paksa nempel atas viewport
+        if (y < margin) y = margin;
+
+        tip.style.left = x + 'px';
+        tip.style.top  = y + 'px';
+    }
+})();
 </script>
 
 </body>

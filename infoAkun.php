@@ -502,23 +502,31 @@ $fotoRejected = count(array_filter($userGaleri, fn($g) => ($g['status'] ?? '') =
                         <div class="form-row">
                             <label>Kata Sandi Lama</label>
                             <div class="input-group">
-                                <input type="password" name="password_lama" class="input-field" placeholder="Masukkan kata sandi lama" id="pwLama">
-                                <i class="fas fa-eye-slash toggle-password" onclick="togglePw('pwLama',this)"></i>
+                                <input type="password" name="password_lama" class="input-field" placeholder="Masukkan kata sandi lama" id="pwLama" style="padding-right:44px">
+                                <i class="fas fa-eye toggle-password" onclick="togglePw('pwLama',this)"></i>
                             </div>
                         </div>
                         <div class="form-row">
                             <label>Kata Sandi Baru</label>
                             <div class="input-group">
-                                <input type="password" name="password_baru" class="input-field" placeholder="Minimal 6 karakter" id="pwBaru">
-                                <i class="fas fa-eye-slash toggle-password" onclick="togglePw('pwBaru',this)"></i>
+                                <input type="password" name="password_baru" class="input-field" placeholder="Minimal 6 karakter" id="pwBaru"
+                                       oninput="checkPwStrength(this.value)" style="padding-right:44px">
+                                <i class="fas fa-eye toggle-password" onclick="togglePw('pwBaru',this)"></i>
                             </div>
+                            <!-- Strength bar -->
+                            <div style="height:4px;background:rgba(255,255,255,.1);border-radius:4px;margin-top:8px;overflow:hidden">
+                                <div id="pwStrengthBar" style="height:100%;width:0;border-radius:4px;transition:all .3s"></div>
+                            </div>
+                            <p id="pwStrengthLabel" style="font-size:12px;color:#6b7280;margin-top:4px;">Minimal 6 karakter</p>
                         </div>
                         <div class="form-row">
                             <label>Konfirmasi Kata Sandi Baru</label>
                             <div class="input-group">
-                                <input type="password" name="password_konfirm" class="input-field" placeholder="Ulangi kata sandi baru" id="pwKonfirm">
-                                <i class="fas fa-eye-slash toggle-password" onclick="togglePw('pwKonfirm',this)"></i>
+                                <input type="password" name="password_konfirm" class="input-field" placeholder="Ulangi kata sandi baru" id="pwKonfirm"
+                                       oninput="checkPwMatch()" style="padding-right:44px">
+                                <i class="fas fa-eye toggle-password" onclick="togglePw('pwKonfirm',this)"></i>
                             </div>
+                            <p id="pwMatchLabel" style="font-size:12px;margin-top:4px;display:none;"></p>
                         </div>
                         <button type="submit" class="btn-save">Simpan Kata Sandi</button>
                     </form>
@@ -826,8 +834,54 @@ $fotoRejected = count(array_filter($userGaleri, fn($g) => ($g['status'] ?? '') =
         const f = document.getElementById(id);
         const show = f.type === 'password';
         f.type = show ? 'text' : 'password';
-        icon.classList.toggle('fa-eye-slash', !show);
-        icon.classList.toggle('fa-eye', show);
+        icon.className = show ? 'fas fa-eye-slash toggle-password' : 'fas fa-eye toggle-password';
+    }
+
+    // ---- Password strength checker ----
+    function checkPwStrength(val) {
+        const bar   = document.getElementById('pwStrengthBar');
+        const label = document.getElementById('pwStrengthLabel');
+
+        if (!val) {
+            bar.style.width = '0';
+            label.textContent = 'Minimal 6 karakter';
+            label.style.color = '#6b7280';
+            return;
+        }
+
+        let score = 0;
+        if (val.length >= 6)  score++;
+        if (val.length >= 10) score++;
+        if (/[A-Z]/.test(val) && /[a-z]/.test(val)) score++;
+        if (/[0-9]/.test(val)) score++;
+        if (/[^A-Za-z0-9]/.test(val)) score++;
+
+        const lv = score <= 1 ? {w:'20%', c:'#e74c3c', t:'Lemah'}
+                 : score === 2 ? {w:'45%', c:'#e67e22', t:'Cukup'}
+                 : score === 3 ? {w:'70%', c:'#f1c40f', t:'Kuat'}
+                 : {w:'100%', c:'#27ae60', t:'Sangat Kuat 💪'};
+
+        bar.style.width      = lv.w;
+        bar.style.background = lv.c;
+        label.textContent    = lv.t;
+        label.style.color    = lv.c;
+
+        checkPwMatch();
+    }
+
+    function checkPwMatch() {
+        const v1 = document.getElementById('pwBaru').value;
+        const v2 = document.getElementById('pwKonfirm').value;
+        const lbl = document.getElementById('pwMatchLabel');
+        if (!v2) { lbl.style.display = 'none'; return; }
+        lbl.style.display = 'block';
+        if (v1 === v2) {
+            lbl.textContent = '✓ Kata sandi cocok';
+            lbl.style.color = '#6fcf97';
+        } else {
+            lbl.textContent = '✕ Kata sandi tidak cocok';
+            lbl.style.color = '#e74c3c';
+        }
     }
 
     // ---- Dropdown galeri ----
